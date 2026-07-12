@@ -26,8 +26,29 @@ enum PollResult {
     Retry,
 }
 
+/// Minimal `getblockchaininfo` response - queried directly instead of through
+/// bitcoincore-rpc's typed `get_blockchain_info()` helper. That helper first
+/// fetches the daemon version and, for anything reporting < 0.19 (190000),
+/// takes a legacy compatibility path that expects the pre-0.19
+/// `softforks`/`bip9_softforks` fields and fails with "the JSON result had an
+/// unexpected structure" when they're absent. Elektron Net restarted its
+/// version scheme at 4.0.x (CLIENT_VERSION ~40002), so elektrond always
+/// triggers that legacy path even though its RPC output is modern.
+#[derive(Deserialize)]
+struct BlockchainInfo {
+    blocks: u64,
+    headers: u64,
+    #[serde(rename = "initialblockdownload")]
+    initial_block_download: bool,
+    pruned: bool,
+}
+
+fn get_blockchain_info(client: &Client) -> bitcoincore_rpc::Result<BlockchainInfo> {
+    client.call("getblockchaininfo", &[])
+}
+
 fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
-    match client.get_blockchain_info() {
+    match get_blockchain_info(client) {
         Ok(info) => {
             if skip_block_download_wait {
                 // bitcoind RPC is available, don't wait for block download to finish
@@ -127,13 +148,18 @@ impl Daemon {
         }
 
         let network_info = rpc.get_network_info()?;
-        if network_info.version < 21_00_00 {
-            bail!("electrs requires bitcoind 0.21+");
+        // Elektron Net restarted the daemon version scheme at 4.0.0 (=40000),
+        // far below every Bitcoin Core release number, so upstream's
+        // "bitcoind 0.21+" floor (210000) would reject every elektrond. Use a
+        // floor that accepts elektrond (>= 4.0.0) and still passes the CI
+        // integration test, which runs against a recent Bitcoin Core.
+        if network_info.version < 4_00_00 {
+            bail!("electrs requires elektrond 4.0+");
         }
         if !network_info.network_active {
             bail!("electrs requires active bitcoind p2p network");
         }
-        let info = rpc.get_blockchain_info()?;
+        let info = get_blockchain_info(&rpc)?;
         if info.pruned {
             // Elektron Net enforces mandatory pruning on every node
             // (MandatoryPruneDepth = 197,280 blocks ~ 137 days); a non-pruned
