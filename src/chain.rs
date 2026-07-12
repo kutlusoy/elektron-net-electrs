@@ -34,13 +34,47 @@ pub struct Chain {
     heights: HashMap<BlockHash, usize>,
 }
 
+/// Elektron Net mainnet genesis header, built from the values in
+/// elektron-net's src/kernel/chainparams.cpp (CMainParams). This fork
+/// repurposes `Network::Bitcoin` as the Elektron mainnet stand-in (see
+/// doc/elektron.md), and rust-bitcoin's `genesis_block(Network::Bitcoin)`
+/// would seed the chain with Bitcoin's genesis - elektrond's headers can
+/// never attach to that ("missing prev_blockhash" on first sync).
+fn elektron_genesis_header() -> BlockHeader {
+    use bitcoin::hashes::Hash;
+    let header = BlockHeader {
+        version: bitcoin::blockdata::block::Version::from_consensus(1),
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: "0a7087d81dfb14868848c7e02da8408fe721540e63f6cab9a67d0dfc37b19b17"
+            .parse()
+            .expect("valid Elektron genesis merkle root"),
+        time: 1781164284,
+        bits: bitcoin::CompactTarget::from_consensus(0x1d7fffff),
+        nonce: 8892291,
+    };
+    assert_eq!(
+        header.block_hash().to_string(),
+        "00000006b054338443f1a5d5534df21eab0d13232028158ae198edbb169f9dad",
+        "Elektron genesis header constants are inconsistent with chainparams.cpp"
+    );
+    header
+}
+
 impl Chain {
     // create an empty chain
     pub fn new(network: Network) -> Self {
-        let genesis = bitcoin::blockdata::constants::genesis_block(network);
-        let genesis_hash = genesis.block_hash();
+        let genesis_header = match network {
+            // Elektron Net mainnet (Network::Bitcoin is its internal stand-in)
+            Network::Bitcoin => elektron_genesis_header(),
+            // testnet/signet/regtest keep rust-bitcoin's genesis blocks, so
+            // the docker integration test still runs against a stock
+            // Bitcoin Core regtest. An Elektron *testnet* electrs would need
+            // its own genesis here first (different hash per chainparams.cpp).
+            _ => bitcoin::blockdata::constants::genesis_block(network).header,
+        };
+        let genesis_hash = genesis_header.block_hash();
         Self {
-            headers: vec![(genesis_hash, genesis.header)],
+            headers: vec![(genesis_hash, genesis_header)],
             heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
         }
     }
@@ -157,6 +191,20 @@ mod tests {
         assert_eq!(
             regtest.tip(),
             "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+                .parse()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_elektron_mainnet_genesis() {
+        // Network::Bitcoin is the Elektron Net mainnet stand-in: the chain
+        // must start at Elektron's genesis (chainparams.cpp), not Bitcoin's.
+        let mainnet = Chain::new(bitcoin::Network::Bitcoin);
+        assert_eq!(mainnet.height(), 0);
+        assert_eq!(
+            mainnet.tip(),
+            "00000006b054338443f1a5d5534df21eab0d13232028158ae198edbb169f9dad"
                 .parse()
                 .unwrap()
         );

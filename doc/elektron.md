@@ -55,6 +55,16 @@ protocol, so two Elektron Net specifics matter here:
   handshake (`src/p2p.rs`) therefore advertises 70017 instead of
   rust-bitcoin's default constant.
 
+- **Genesis block.** `Network::Bitcoin` serves as the internal Elektron
+  mainnet stand-in, so `src/chain.rs` seeds the header chain with Elektron
+  Net's genesis header (hash
+  `00000006b054338443f1a5d5534df21eab0d13232028158ae198edbb169f9dad`, built
+  from the chainparams.cpp constants and self-checked at startup) instead of
+  rust-bitcoin's Bitcoin genesis — otherwise no header from `elektrond`
+  could ever attach ("missing prev_blockhash"). Consequence: this binary
+  cannot index Bitcoin mainnet, and an Elektron *testnet* deployment would
+  need the analogous override for its own genesis first.
+
 ## Typed "block pruned" Electrum error (code 3)
 
 `blockchain.transaction.get_merkle` and `blockchain.transaction.id_from_pos`
