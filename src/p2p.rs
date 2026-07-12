@@ -320,6 +320,12 @@ impl Connection {
     }
 }
 
+// Elektron Net requires MIN_PEER_PROTO_VERSION = 70017 from genesis (see
+// elektron-net's src/node/protocol_version.h); elektrond disconnects any peer
+// advertising less. rust-bitcoin's p2p::PROTOCOL_VERSION is lower, so it
+// cannot be used here.
+const ELEKTRON_PROTOCOL_VERSION: u32 = 70017;
+
 fn build_version_message() -> NetworkMessage {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
     let timestamp = SystemTime::now()
@@ -330,7 +336,7 @@ fn build_version_message() -> NetworkMessage {
     let services = p2p::ServiceFlags::NONE;
 
     NetworkMessage::Version(message_network::VersionMessage {
-        version: p2p::PROTOCOL_VERSION,
+        version: ELEKTRON_PROTOCOL_VERSION,
         services,
         timestamp,
         receiver: address::Address::new(&addr, services),

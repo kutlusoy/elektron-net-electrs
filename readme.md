@@ -1,6 +1,15 @@
 ![Logo](logo/logo.svg)
 
-# Electrum Server in Rust
+# Electrum Server in Rust — Elektron Net fork
+
+> **This is `elektron-net-electrs`, a permanently-diverged fork of
+> [`romanz/electrs`](https://github.com/romanz/electrs) (based on v0.10.10) for
+> [Elektron Net](https://github.com/kutlusoy/elektron-net)** (mandatory-pruning
+> chain, 60-second blocks). See [doc/elektron.md](doc/elektron.md) for what
+> differs from upstream and
+> [the integration guideline](https://github.com/kutlusoy/elektron-net/blob/main/doc-elektron/guideline-electrs-fork-integration.md)
+> for the full design. The rest of this README is upstream's and refers to
+> Bitcoin.
 
 [![CI](https://github.com/romanz/electrs/actions/workflows/rust.yml/badge.svg)](https://github.com/romanz/electrs/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/romanz/electrs/compare)
