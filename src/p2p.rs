@@ -374,6 +374,18 @@ impl RawNetworkMessage {
             "pong" => ParsedNetworkMessage::Ignored, // unused
             "addr" => ParsedNetworkMessage::Ignored, // unused
             "alert" => ParsedNetworkMessage::Ignored, // https://bitcoin.org/en/alert/2016-11-01-alert-retirement
+            // Advertising protocol version 70017 (required by elektrond, see
+            // build_version_message) makes the daemon send feature-negotiation
+            // and relay messages that peers below 70012..70016 never received.
+            // We don't use any of these features - ignore them instead of
+            // failing the connection.
+            "wtxidrelay" => ParsedNetworkMessage::Ignored, // BIP-339 (version >= 70016)
+            "sendaddrv2" => ParsedNetworkMessage::Ignored, // BIP-155 (version >= 70016)
+            "addrv2" => ParsedNetworkMessage::Ignored,     // BIP-155
+            "sendheaders" => ParsedNetworkMessage::Ignored, // BIP-130 (version >= 70012)
+            "sendcmpct" => ParsedNetworkMessage::Ignored,  // BIP-152 (version >= 70014)
+            "feefilter" => ParsedNetworkMessage::Ignored,  // BIP-133 (version >= 70013)
+            "getheaders" => ParsedNetworkMessage::Ignored, // we serve no headers
             _ => bail!(
                 "unsupported message: command={}, payload={:?}",
                 self.cmd,
