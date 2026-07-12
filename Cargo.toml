@@ -1,0 +1,52 @@
+[package]
+name = "electrs"
+version = "0.11.1"
+authors = ["Roman Zeyde <me@romanzey.de>"]
+description = "An efficient re-implementation of Electrum Server in Rust"
+license = "MIT"
+homepage = "https://github.com/romanz/electrs"
+repository = "https://github.com/romanz/electrs"
+keywords = ["bitcoin", "electrum", "server", "index", "database"]
+documentation = "https://docs.rs/electrs/"
+readme = "README.md"
+edition = "2021"
+rust-version = "1.85.0"
+build = "build.rs"
+
+[features]
+default = ["metrics"]
+metrics = ["prometheus", "tiny_http"]
+metrics_process = ["prometheus/process"]
+
+[package.metadata.configure_me]
+spec = "internal/config_specification.toml"
+
+[dependencies]
+anyhow = "1.0"
+bindex = { version = "0.1.1", default-features = false, features = ["bitcoin_serde"] }
+configure_me = "0.4"
+crossbeam-channel = "0.5"
+dirs-next = "2.0"
+env_logger = "0.10"
+jsonrpc = { version = "0.20.1", default-features = false, features = ["simple_http"]}
+log = "0.4"
+prometheus = { version = "0.14", optional = true }
+rayon = "1.12"
+serde = "1.0.184"
+serde_derive = "1.0.184"
+serde_json = "1.0"
+tiny_http = { version = "0.12", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+ctrlc = "=3.5.2"
+
+[target.'cfg(not(windows))'.dependencies]
+signal-hook = "0.4"
+
+[build-dependencies]
+configure_me_codegen = { version = "0.4.8", default-features = false }
+
+[dev-dependencies]
+bitcoin-test-data = "0.2.0"
+hex_lit = "0.1.1"
+tempfile = "3.25"
