@@ -92,6 +92,10 @@ enum RpcError {
     BadRequest(anyhow::Error),
     DaemonError(daemon::RpcError),
     UnavailableIndex,
+    // Elektron Net: the block body needed for the response was pruned.
+    // Expected (permanent) for heights older than the mandatory retention
+    // window - clients must be able to tell this apart from a malfunction.
+    BlockPruned(usize),
 }
 
 impl RpcError {
@@ -115,9 +119,34 @@ impl RpcError {
                 // Internal JSON-RPC error (https://www.jsonrpc.org/specification#error_object)
                 json!({"code": -32603, "message": "unavailable index"})
             }
+            RpcError::BlockPruned(height) => json!({
+                "code": 3,
+                "message": format!(
+                    "block at height {} is pruned - unavailable by design (Elektron Net mandatory pruning)",
+                    height
+                ),
+            }),
         }
     }
 }
+
+/// Marker error: a block body required for the response has been pruned by
+/// the daemon. On Elektron Net every node prunes block bodies older than the
+/// retention window (headers are always kept), so for old heights this is an
+/// expected, permanent condition - not a transient failure. Mapped to a typed
+/// Electrum error (`RpcError::BlockPruned`) in `Call::response()`.
+#[derive(Debug)]
+struct BlockPrunedError {
+    height: usize,
+}
+
+impl fmt::Display for BlockPrunedError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "block at height {} is pruned", self.height)
+    }
+}
+
+impl std::error::Error for BlockPrunedError {}
 
 /// Electrum RPC handler
 pub struct Rpc {
@@ -394,13 +423,32 @@ impl Rpc {
         Ok(json!(self.daemon.get_transaction_hex(&txid, None)?))
     }
 
+    /// Fetch a block's txids via RPC, mapping the daemon's "pruned data"
+    /// failure to a typed `BlockPrunedError` so clients can distinguish
+    /// "unavailable by design" from a server malfunction (see §3.4 of the
+    /// fork integration guideline in the elektron-net repo).
+    fn get_block_txids_or_pruned(&self, blockhash: BlockHash, height: usize) -> Result<Vec<Txid>> {
+        self.daemon.get_block_txids(blockhash).map_err(|err| {
+            let is_pruned = matches!(
+                err.downcast_ref::<bitcoincore_rpc::Error>()
+                    .and_then(extract_bitcoind_error),
+                Some(e) if e.message.contains("pruned")
+            );
+            if is_pruned {
+                anyhow::Error::new(BlockPrunedError { height })
+            } else {
+                err
+            }
+        })
+    }
+
     fn transaction_get_merkle(&self, (txid, height): &(Txid, usize)) -> Result<Value> {
         let chain = self.tracker.chain();
         let blockhash = match chain.get_block_hash(*height) {
             None => bail!("missing block at {}", height),
             Some(blockhash) => blockhash,
         };
-        let txids = self.daemon.get_block_txids(blockhash)?;
+        let txids = self.get_block_txids_or_pruned(blockhash, *height)?;
         match txids.iter().position(|current_txid| *current_txid == *txid) {
             None => bail!("missing txid {} in block {}", txid, blockhash),
             Some(position) => {
@@ -423,7 +471,7 @@ impl Rpc {
             None => bail!("missing block at {}", height),
             Some(blockhash) => blockhash,
         };
-        let txids = self.daemon.get_block_txids(blockhash)?;
+        let txids = self.get_block_txids_or_pruned(blockhash, height)?;
         if tx_pos >= txids.len() {
             bail!("invalid tx_pos {} in block at height {}", tx_pos, height);
         }
@@ -653,6 +701,12 @@ impl Call {
         match result {
             Ok(value) => result_msg(&self.id, value),
             Err(err) => {
+                if let Some(e) = err.downcast_ref::<BlockPrunedError>() {
+                    // expected on Elektron Net for heights past the retention
+                    // window - typed response, and no scary warning log
+                    debug!("RPC {}: {}", self.method, e);
+                    return error_msg(&self.id, RpcError::BlockPruned(e.height));
+                }
                 warn!("RPC {} failed: {:#}", self.method, err);
                 match err
                     .downcast_ref::<bitcoincore_rpc::Error>()

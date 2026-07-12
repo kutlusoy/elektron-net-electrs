@@ -135,7 +135,13 @@ impl Daemon {
         }
         let info = rpc.get_blockchain_info()?;
         if info.pruned {
-            bail!("electrs requires non-pruned bitcoind node");
+            // Elektron Net enforces mandatory pruning on every node
+            // (MandatoryPruneDepth = 197,280 blocks ~ 137 days); a non-pruned
+            // node does not exist on this network, so a pruned daemon is the
+            // expected steady state, not an error. Block bodies older than
+            // the retention window are unavailable by design (headers are
+            // always retained).
+            info!("connected to a pruned node (mandatory on Elektron Net)");
         }
 
         let p2p = Mutex::new(Connection::connect(

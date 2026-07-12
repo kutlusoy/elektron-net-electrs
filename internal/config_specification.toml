@@ -150,4 +150,4 @@ doc = "Logging filters, overriding `RUST_LOG` environment variable (see https://
 [[param]]
 name = "signet_magic"
 type = "String"
-doc = "network magic for custom signet network in hex format, as found in Bitcoin Core logs (signet only)"
+doc = "network magic in hex format, overriding the network default (Elektron Net mainnet: e1ec7a6e), as found in the daemon's logs"
