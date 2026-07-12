@@ -3,7 +3,11 @@ name: electrs
 on:
   push:
     branches:
+      # this fork's default branch is `main` (upstream uses `master`);
+      # `integration` is the Elektron Net adaptation branch
+      - main
       - master
+      - integration
   pull_request:
   schedule:
     - cron: "0 0 * * *" # once a day

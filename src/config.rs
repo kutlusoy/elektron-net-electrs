@@ -246,19 +246,20 @@ impl Config {
             unsupported => unsupported_network(unsupported),
         };
 
-        let magic = match (config.network, config.signet_magic) {
-            (Network::Signet, Some(magic)) => magic.parse().unwrap_or_else(|error| {
+        // Elektron Net: allow overriding the P2P network magic on any network,
+        // not just signet (upstream 0.11.1 made the same change). Elektron Net
+        // mainnet uses magic e1ec7a6e (see elektron-net's chainparams.cpp) while
+        // rust-bitcoin's Network::Bitcoin stand-in would default to Bitcoin's
+        // f9beb4d9, so running against elektrond requires setting this option.
+        let magic = match config.signet_magic {
+            Some(magic) => magic.parse().unwrap_or_else(|error| {
                 eprintln!(
-                    "Error: signet magic '{}' is not a valid hex string: {}",
+                    "Error: network magic '{}' is not a valid hex string: {}",
                     magic, error
                 );
                 std::process::exit(1);
             }),
-            (network, None) => network.magic(),
-            (_, Some(_)) => {
-                eprintln!("Error: signet magic only available on signet");
-                std::process::exit(1);
-            }
+            None => config.network.magic(),
         };
 
         let daemon_rpc_addr: SocketAddr = config.daemon_rpc_addr.map_or(
