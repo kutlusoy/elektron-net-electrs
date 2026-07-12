@@ -1,11 +1,11 @@
-use crate::bitcoin::{
+use anyhow::{bail, Context, Result};
+use bitcoin::{
     consensus::{deserialize, encode::serialize_hex},
     hashes::hex::FromHex,
     hex::DisplayHex,
-    BlockHash, Transaction, Txid,
+    BlockHash, Txid,
 };
-use anyhow::{bail, Context, Result};
-use bindex::ScriptHash;
+use crossbeam_channel::Receiver;
 use rayon::prelude::*;
 use serde_derive::Deserialize;
 use serde_json::{self, json, Value};
@@ -13,17 +13,18 @@ use serde_json::{self, json, Value};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::iter::FromIterator;
-use std::net::SocketAddr;
 use std::str::FromStr;
 
 use crate::{
+    cache::Cache,
     config::{Config, ELECTRS_VERSION},
-    daemon::{extract_bitcoind_error, Daemon},
+    daemon::{self, extract_bitcoind_error, Daemon},
     merkle::Proof,
     metrics::{self, Histogram, Metrics},
     signals::Signal,
     status::ScriptHashStatus,
     tracker::Tracker,
+    types::ScriptHash,
 };
 
 const PROTOCOL_VERSION: &str = "1.4";
@@ -77,29 +78,6 @@ impl From<&TxGetArgs> for (Txid, bool) {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum BroadcastArgs {
-    Package((Vec<String>,)),
-    PackageVerbose((Vec<String>, bool)),
-}
-
-impl BroadcastArgs {
-    fn txs(&self) -> &[String] {
-        match self {
-            BroadcastArgs::Package((txs,)) => txs,
-            BroadcastArgs::PackageVerbose((txs, _)) => txs,
-        }
-    }
-
-    fn verbose(&self) -> bool {
-        match self {
-            BroadcastArgs::Package(_) => false,
-            BroadcastArgs::PackageVerbose((_, verbose)) => *verbose,
-        }
-    }
-}
-
 enum StandardError {
     ParseError,
     InvalidRequest,
@@ -112,7 +90,7 @@ enum RpcError {
     Standard(StandardError),
     // Electrum-specific errors
     BadRequest(anyhow::Error),
-    DaemonError(jsonrpc::error::RpcError),
+    DaemonError(daemon::RpcError),
     UnavailableIndex,
 }
 
@@ -144,11 +122,12 @@ impl RpcError {
 /// Electrum RPC handler
 pub struct Rpc {
     tracker: Tracker,
+    cache: Cache,
     rpc_duration: Histogram,
     daemon: Daemon,
     signal: Signal,
     banner: String,
-    addr: SocketAddr,
+    port: u16,
 }
 
 impl Rpc {
@@ -163,14 +142,16 @@ impl Rpc {
 
         let tracker = Tracker::new(config, metrics)?;
         let signal = Signal::new();
-        let daemon = Daemon::connect(config, signal.exit_flag())?;
+        let daemon = Daemon::connect(config, signal.exit_flag(), tracker.metrics())?;
+        let cache = Cache::new(tracker.metrics());
         Ok(Self {
             tracker,
+            cache,
             rpc_duration,
             daemon,
             signal,
             banner: config.server_banner.clone(),
-            addr: config.electrum_rpc_addr,
+            port: config.electrum_rpc_addr.port(),
         })
     }
 
@@ -178,17 +159,24 @@ impl Rpc {
         &self.signal
     }
 
+    pub fn new_block_notification(&self) -> Receiver<()> {
+        self.daemon.new_block_notification()
+    }
+
     pub fn sync(&mut self) -> Result<bool> {
         self.tracker.sync(&self.daemon, self.signal.exit_flag())
     }
 
     pub fn update_client(&self, client: &mut Client) -> Result<Vec<String>> {
-        let headers = self.tracker.headers();
+        let chain = self.tracker.chain();
         let mut notifications = client
             .scripthashes
             .par_iter_mut()
             .filter_map(|(scripthash, status)| -> Option<Result<Value>> {
-                match self.tracker.update_scripthash_status(status) {
+                match self
+                    .tracker
+                    .update_scripthash_status(status, &self.daemon, &self.cache)
+                {
                     Ok(true) => Some(Ok(notification(
                         "blockchain.scripthash.subscribe",
                         &[json!(scripthash), json!(status.statushash())],
@@ -201,11 +189,11 @@ impl Rpc {
             .context("failed to update status")?;
 
         if let Some(old_tip) = client.tip {
-            let new_tip = headers.tip().unwrap();
-            if old_tip != new_tip.hash() {
-                client.tip = Some(new_tip.hash());
-                let height = headers.tip_height().unwrap();
-                let header = new_tip.header();
+            let new_tip = self.tracker.chain().tip();
+            if old_tip != new_tip {
+                client.tip = Some(new_tip);
+                let height = chain.height();
+                let header = chain.get_block_header(height).unwrap();
                 notifications.push(notification(
                     "blockchain.headers.subscribe",
                     &[json!({"hex": serialize_hex(&header), "height": height})],
@@ -216,36 +204,34 @@ impl Rpc {
     }
 
     fn headers_subscribe(&self, client: &mut Client) -> Result<Value> {
-        let headers = self.tracker.headers();
-        let height = headers.tip_height().unwrap();
-        let header = headers.tip().unwrap();
-        client.tip = Some(header.hash());
-        Ok(json!({"hex": serialize_hex(header.header()), "height": height}))
+        let chain = self.tracker.chain();
+        client.tip = Some(chain.tip());
+        let height = chain.height();
+        let header = chain.get_block_header(height).unwrap();
+        Ok(json!({"hex": serialize_hex(header), "height": height}))
     }
 
     fn block_header(&self, (height,): (usize,)) -> Result<Value> {
-        let header = match self.tracker.headers().iter_headers().nth(height) {
+        let chain = self.tracker.chain();
+        let header = match chain.get_block_header(height) {
             None => bail!("no header at {}", height),
             Some(header) => header,
         };
-        Ok(json!(serialize_hex(header.header())))
+        Ok(json!(serialize_hex(header)))
     }
 
     fn block_headers(&self, (start_height, count): (usize, usize)) -> Result<Value> {
-        let headers = self.tracker.headers();
+        let chain = self.tracker.chain();
         let max_count = 2016usize;
         // return only the available block headers
         let end_height = std::cmp::min(
-            headers.tip_height().map_or(0, |h| h + 1),
+            chain.height() + 1,
             start_height + std::cmp::min(count, max_count),
         );
         let heights = start_height..end_height;
         let count = heights.len();
-        let hex_headers = headers
-            .iter_headers()
-            .skip(start_height)
-            .take(count)
-            .map(|h| serialize_hex(h.header()));
+        let hex_headers =
+            heights.filter_map(|height| chain.get_block_header(height).map(serialize_hex));
 
         Ok(json!({"count": count, "hex": String::from_iter(hex_headers), "max": max_count}))
     }
@@ -367,43 +353,16 @@ impl Rpc {
 
     fn new_status(&self, scripthash: ScriptHash) -> Result<ScriptHashStatus> {
         let mut status = ScriptHashStatus::new(scripthash);
-        self.tracker.update_scripthash_status(&mut status)?;
+        self.tracker
+            .update_scripthash_status(&mut status, &self.daemon, &self.cache)?;
         Ok(status)
     }
 
     fn transaction_broadcast(&self, (tx_hex,): &(String,)) -> Result<Value> {
-        let txid = self.daemon.broadcast(&tx_from_hex(tx_hex)?)?;
+        let tx_bytes = Vec::from_hex(tx_hex).context("non-hex transaction")?;
+        let tx = deserialize(&tx_bytes).context("invalid transaction")?;
+        let txid = self.daemon.broadcast(&tx)?;
         Ok(json!(txid))
-    }
-
-    fn transaction_broadcast_package(&self, args: &BroadcastArgs) -> Result<Value> {
-        let txs: Vec<Transaction> = args
-            .txs()
-            .iter()
-            .map(|s| tx_from_hex(s))
-            .collect::<Result<_>>()?;
-        let response = self.daemon.submitpackage(&txs)?;
-        if args.verbose() {
-            return Ok(response);
-        }
-        let build_result = || -> Option<Value> {
-            let success = response.get("package_msg")? == &json!("success");
-
-            let mut errors = vec![];
-            for tx in response.get("tx-results")?.as_object()?.values() {
-                let tx_obj = tx.as_object()?;
-                if let Some(error) = tx_obj.get("error") {
-                    let txid = tx_obj.get("txid");
-                    errors.push(json!({"error": error, "txid": txid}));
-                }
-            }
-            Some(if errors.is_empty() {
-                json!({"success": success})
-            } else {
-                json!({"success": success, "errors": errors})
-            })
-        };
-        build_result().ok_or(anyhow!("Unexpected `submitpackage` response"))
     }
 
     fn transaction_get(&self, args: &TxGetArgs) -> Result<Value> {
@@ -411,26 +370,35 @@ impl Rpc {
         if verbose {
             let blockhash = self
                 .tracker
-                .lookup_transaction(txid)?
+                .lookup_transaction(&self.daemon, txid)?
                 .map(|(blockhash, _tx)| blockhash);
-            return self.daemon.get_transaction(&txid, blockhash, verbose);
+            return self.daemon.get_transaction_info(&txid, blockhash);
         }
+        // if the scripthash was subscribed, tx should be cached
+        if let Some(tx_hex) = self
+            .cache
+            .get_tx(&txid, |tx_bytes| tx_bytes.to_lower_hex_string())
+        {
+            return Ok(json!(tx_hex));
+        }
+        debug!("tx cache miss: txid={}", txid);
         // use internal index to load confirmed transaction
         if let Some(tx_hex) = self
             .tracker
-            .lookup_transaction(txid)?
+            .lookup_transaction(&self.daemon, txid)?
             .map(|(_blockhash, tx)| tx.to_lower_hex_string())
         {
             return Ok(json!(tx_hex));
         }
         // load unconfirmed transaction via RPC
-        Ok(json!(self.daemon.get_transaction(&txid, None, verbose)?))
+        Ok(json!(self.daemon.get_transaction_hex(&txid, None)?))
     }
 
     fn transaction_get_merkle(&self, (txid, height): &(Txid, usize)) -> Result<Value> {
-        let blockhash = match self.tracker.headers().iter_headers().nth(*height) {
+        let chain = self.tracker.chain();
+        let blockhash = match chain.get_block_hash(*height) {
             None => bail!("missing block at {}", height),
-            Some(header) => header.hash(),
+            Some(blockhash) => blockhash,
         };
         let txids = self.daemon.get_block_txids(blockhash)?;
         match txids.iter().position(|current_txid| *current_txid == *txid) {
@@ -450,9 +418,10 @@ impl Rpc {
         &self,
         (height, tx_pos, merkle): (usize, usize, bool),
     ) -> Result<Value> {
-        let blockhash = match self.tracker.headers().iter_headers().nth(height) {
+        let chain = self.tracker.chain();
+        let blockhash = match chain.get_block_hash(height) {
             None => bail!("missing block at {}", height),
-            Some(header) => header.hash(),
+            Some(blockhash) => blockhash,
         };
         let txids = self.daemon.get_block_txids(blockhash)?;
         if tx_pos >= txids.len() {
@@ -461,9 +430,9 @@ impl Rpc {
         let txid: Txid = txids[tx_pos];
         if merkle {
             let proof = Proof::create(&txids, tx_pos);
-            Ok(json!({"tx_hash": txid, "merkle": proof.to_hex()}))
+            Ok(json!({"tx_id": txid, "merkle": proof.to_hex()}))
         } else {
-            Ok(json!({ "tx_hash": txid }))
+            Ok(json!({ "tx_id": txid }))
         }
     }
 
@@ -486,12 +455,8 @@ impl Rpc {
 
     fn features(&self) -> Result<Value> {
         Ok(json!({
-            "genesis_hash": self.tracker.headers().genesis().unwrap().hash(),
-            "hosts": {
-                self.addr.ip().to_string(): {
-                    "tcp_port": self.addr.port()
-                }
-            },
+            "genesis_hash": self.tracker.chain().get_block_hash(0),
+            "hosts": { "tcp_port": self.port },
             "protocol_max": PROTOCOL_VERSION,
             "protocol_min": PROTOCOL_VERSION,
             "pruning": null,
@@ -597,9 +562,6 @@ impl Rpc {
                 Params::ScriptHashSubscribe(args) => self.scripthash_subscribe(client, args),
                 Params::ScriptHashUnsubscribe(args) => self.scripthash_unsubscribe(client, args),
                 Params::TransactionBroadcast(args) => self.transaction_broadcast(args),
-                Params::TransactionBroadcastPackage(args) => {
-                    self.transaction_broadcast_package(args)
-                }
                 Params::TransactionGet(args) => self.transaction_get(args),
                 Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
                 Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
@@ -616,7 +578,6 @@ enum Params {
     BlockHeader((usize,)),
     BlockHeaders((usize, usize)),
     TransactionBroadcast((String,)),
-    TransactionBroadcastPackage(BroadcastArgs),
     Donation,
     EstimateFee((u16,)),
     Features,
@@ -650,9 +611,6 @@ impl Params {
             "blockchain.scripthash.subscribe" => Params::ScriptHashSubscribe(convert(params)?),
             "blockchain.scripthash.unsubscribe" => Params::ScriptHashUnsubscribe(convert(params)?),
             "blockchain.transaction.broadcast" => Params::TransactionBroadcast(convert(params)?),
-            "blockchain.transaction.broadcast_package" => {
-                Params::TransactionBroadcastPackage(convert(params)?)
-            }
             "blockchain.transaction.get" => Params::TransactionGet(convert(params)?),
             "blockchain.transaction.get_merkle" => Params::TransactionGetMerkle(convert(params)?),
             "blockchain.transaction.id_from_pos" => {
@@ -697,7 +655,7 @@ impl Call {
             Err(err) => {
                 warn!("RPC {} failed: {:#}", self.method, err);
                 match err
-                    .downcast_ref::<jsonrpc::Error>()
+                    .downcast_ref::<bitcoincore_rpc::Error>()
                     .and_then(extract_bitcoind_error)
                 {
                     Some(e) => error_msg(&self.id, RpcError::DaemonError(e.clone())),
@@ -803,12 +761,6 @@ fn check_between(version_str: &str, min_str: &str, max_str: &str) -> Result<()> 
         bail!("version {} > {}", version, max);
     }
     Ok(())
-}
-
-fn tx_from_hex(tx_hex: &str) -> Result<Transaction> {
-    let tx_bytes = Vec::from_hex(tx_hex).context("non-hex transaction")?;
-    let tx = deserialize(&tx_bytes).context("invalid transaction")?;
-    Ok(tx)
 }
 
 #[cfg(test)]

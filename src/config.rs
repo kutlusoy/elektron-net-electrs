@@ -1,5 +1,6 @@
-use crate::bitcoin::Network;
-use crate::types::Auth;
+use bitcoin::p2p::Magic;
+use bitcoin::Network;
+use bitcoincore_rpc::Auth;
 use dirs_next::home_dir;
 
 use std::ffi::{OsStr, OsString};
@@ -16,7 +17,6 @@ pub const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SERVER_ADDRESS: [u8; 4] = [127, 0, 0, 1]; // by default, serve on IPv4 localhost
 
 mod internal {
-    #![allow(unused_attributes, unused_imports, clippy::enum_variant_names)]
     include!(concat!(env!("OUT_DIR"), "/configure_me_config.rs"));
 }
 
@@ -121,20 +121,21 @@ impl From<BitcoinNetwork> for Network {
 }
 
 /// Parsed and post-processed configuration
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Config {
     // See below for the documentation of each field:
     pub network: Network,
-    pub db_dir: PathBuf,
+    pub db_path: PathBuf,
     pub db_log_dir: Option<PathBuf>,
     pub db_parallelism: u8,
     pub daemon_auth: SensitiveAuth,
     pub daemon_rpc_addr: SocketAddr,
+    pub daemon_p2p_addr: SocketAddr,
     pub electrum_rpc_addr: SocketAddr,
     pub monitoring_addr: SocketAddr,
     pub wait_duration: Duration,
     pub jsonrpc_timeout: Duration,
+    pub index_batch_size: usize,
     pub index_lookup_limit: Option<usize>,
     pub reindex_last_blocks: usize,
     pub auto_reindex: bool,
@@ -143,6 +144,7 @@ pub struct Config {
     pub skip_block_download_wait: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
+    pub signet_magic: Magic,
 }
 
 pub struct SensitiveAuth(pub Auth);
@@ -195,12 +197,37 @@ impl Config {
             internal::prelude::Config::including_optional_config_files(default_config_files())
                 .unwrap_or_exit();
 
+        fn unsupported_network(network: Network) -> ! {
+            eprintln!("Error: unsupported network: {}", network);
+            std::process::exit(1);
+        }
+
+        let db_subdir = match config.network {
+            Network::Bitcoin => "bitcoin",
+            Network::Testnet => "testnet",
+            Network::Testnet4 => "testnet4",
+            Network::Regtest => "regtest",
+            Network::Signet => "signet",
+            unsupported => unsupported_network(unsupported),
+        };
+
+        config.db_dir.push(db_subdir);
+
         let default_daemon_rpc_port = match config.network {
             Network::Bitcoin => 8332,
             Network::Testnet => 18332,
             Network::Testnet4 => 48332,
             Network::Regtest => 18443,
             Network::Signet => 38332,
+            unsupported => unsupported_network(unsupported),
+        };
+        let default_daemon_p2p_port = match config.network {
+            Network::Bitcoin => 8333,
+            Network::Testnet => 18333,
+            Network::Testnet4 => 48333,
+            Network::Regtest => 18444,
+            Network::Signet => 38333,
+            unsupported => unsupported_network(unsupported),
         };
         let default_electrum_port = match config.network {
             Network::Bitcoin => 50001,
@@ -208,6 +235,7 @@ impl Config {
             Network::Testnet4 => 40001,
             Network::Regtest => 60401,
             Network::Signet => 60601,
+            unsupported => unsupported_network(unsupported),
         };
         let default_monitoring_port = match config.network {
             Network::Bitcoin => 4224,
@@ -215,10 +243,30 @@ impl Config {
             Network::Testnet4 => 44224,
             Network::Regtest => 24224,
             Network::Signet => 34224,
+            unsupported => unsupported_network(unsupported),
+        };
+
+        let magic = match (config.network, config.signet_magic) {
+            (Network::Signet, Some(magic)) => magic.parse().unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: signet magic '{}' is not a valid hex string: {}",
+                    magic, error
+                );
+                std::process::exit(1);
+            }),
+            (network, None) => network.magic(),
+            (_, Some(_)) => {
+                eprintln!("Error: signet magic only available on signet");
+                std::process::exit(1);
+            }
         };
 
         let daemon_rpc_addr: SocketAddr = config.daemon_rpc_addr.map_or(
             (DEFAULT_SERVER_ADDRESS, default_daemon_rpc_port).into(),
+            ResolvAddr::resolve_or_exit,
+        );
+        let daemon_p2p_addr: SocketAddr = config.daemon_p2p_addr.map_or(
+            (DEFAULT_SERVER_ADDRESS, default_daemon_p2p_port).into(),
             ResolvAddr::resolve_or_exit,
         );
         let electrum_rpc_addr: SocketAddr = config.electrum_rpc_addr.map_or(
@@ -243,6 +291,7 @@ impl Config {
             Network::Testnet4 => config.daemon_dir.push("testnet4"),
             Network::Regtest => config.daemon_dir.push("regtest"),
             Network::Signet => config.daemon_dir.push("signet"),
+            unsupported => unsupported_network(unsupported),
         }
 
         let mut deprecated_options_used = false;
@@ -304,15 +353,17 @@ impl Config {
 
         let config = Config {
             network: config.network,
-            db_dir: config.db_dir,
+            db_path: config.db_dir,
             db_log_dir: config.db_log_dir,
             db_parallelism: config.db_parallelism,
             daemon_auth,
             daemon_rpc_addr,
+            daemon_p2p_addr,
             electrum_rpc_addr,
             monitoring_addr,
             wait_duration: Duration::from_secs(config.wait_duration_secs),
             jsonrpc_timeout: Duration::from_secs(config.jsonrpc_timeout_secs),
+            index_batch_size: config.index_batch_size,
             index_lookup_limit,
             reindex_last_blocks: config.reindex_last_blocks,
             auto_reindex: config.auto_reindex,
@@ -321,6 +372,7 @@ impl Config {
             skip_block_download_wait: config.skip_block_download_wait,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
+            signet_magic: magic,
         };
         eprintln!(
             "Starting electrs {} on {} {} with {:?}",
@@ -344,6 +396,9 @@ mod tests {
 
     #[test]
     fn test_auth_debug() {
+        let auth = Auth::None;
+        assert_eq!(format!("{:?}", SensitiveAuth(auth)), "None");
+
         let auth = Auth::CookieFile(Path::new("/foo/bar/.cookie").to_path_buf());
         assert_eq!(
             format!("{:?}", SensitiveAuth(auth)),

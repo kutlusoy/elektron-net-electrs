@@ -1,19 +1,3 @@
-# 0.11.1 (Feb 22 2026)
-
-* Update `transaction.id_from_pos` response for API compliance.
-* Expose configurable magic on non-signet.
-* Update dependencies (`bitcoin`, `ctrlc`, `log`, `serde_json`, `signal-hook`, `tempfile`).
-
-# 0.11.0 (Nov 16 2025)
-
-* Update MSRV to 1.85
-* Support Debian 13 (trixie) / Ubuntu 25.04 (plucky)
-* Update RocksDB crate to `rust-rocksdb` 0.36
-  - [Dynamic linking with RocksDB](doc/install.md) now requires [RocksDB 9.10.0](https://packages.debian.org/trixie/librocksdb-dev) (instead of 7.8.3).
-  - Old electrs versions won't be able to read the new RocksDB database format (requiring reindex).
-* Support `blockchain.transaction.broadcast_package` Electrum RPC.
-* Update dependencies (`bitcoin`, `ctrlc`, `log`, `prometheus`, `rayon`, `serde`, `serde_json`, `tempfile`, `tempfile`).
-
 # 0.10.10 (Jul 19 2025)
 
 * Update documentation links and typos.

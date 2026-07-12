@@ -41,7 +41,7 @@ which is better optimized for public usage at the cost of consuming *significant
 
 ## Features
 
- * Supports Electrum protocol [v1.4](https://electrum-protocol.readthedocs.io/)
+ * Supports Electrum protocol [v1.4](https://electrumx-spesmilo.readthedocs.io/en/latest/protocol.html)
  * Maintains an index over transaction inputs and outputs, allowing fast balance queries
  * Fast synchronization of the Bitcoin blockchain (~6.5 hours for ~504GB @ August 2023) using HDD storage.
  * Low index storage overhead (~10%), relying on a local full node for transaction retrieval
@@ -69,4 +69,4 @@ All contributions to this project are welcome. Please refer to the [Contributing
 
 [Our logo](logo/) is generously provided by [Dominik Průša](https://github.com/DominoPrusa) under the MIT license.
 Based on the [Electrum logo](https://github.com/spesmilo/electrum/blob/master/LICENCE)
-and the [Rust language logo](https://rustfoundation.org/policy/rust-trademark-policy).
+and the [Rust language logo](https://www.rust-lang.org/policies/media-guide).

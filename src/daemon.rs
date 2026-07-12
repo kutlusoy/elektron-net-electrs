@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 
-use crate::bitcoin::{
-    self, consensus::deserialize, consensus::encode::serialize_hex, hashes::hex::FromHex, Amount,
-    BlockHash, Transaction, Txid,
-};
-use crate::types::Auth;
+use bitcoin::{consensus::deserialize, hashes::hex::FromHex};
+use bitcoin::{Amount, BlockHash, Transaction, Txid};
+use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
+use crossbeam_channel::Receiver;
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, value::RawValue, Value};
 
@@ -12,62 +12,52 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::{config::Config, signals::ExitFlag};
+use crate::{
+    chain::{Chain, NewHeader},
+    config::Config,
+    metrics::Metrics,
+    p2p::Connection,
+    signals::ExitFlag,
+    types::SerBlock,
+};
 
 enum PollResult {
     Done(Result<()>),
     Retry,
 }
 
-#[derive(Deserialize)]
-pub struct GetMempoolEntryResultFees {
-    /// Transaction fee in BTC
-    #[serde(with = "bitcoin::amount::serde::as_btc")]
-    pub base: Amount,
-}
-
-#[derive(Deserialize)]
-pub struct GetMempoolEntryResult {
-    /// Virtual transaction size as defined in BIP 141. This is different from actual serialized
-    /// size for witness transactions as witness data is discounted.
-    #[serde(alias = "size")]
-    pub vsize: u64,
-    /// Fee information
-    pub fees: GetMempoolEntryResultFees,
-    /// Unconfirmed transactions used as inputs for this transaction
-    pub depends: Vec<bitcoin::Txid>,
-}
-
-#[derive(Deserialize)]
-pub struct GetBlockchainInfoResult {
-    pub blocks: u64,
-    pub headers: u64,
-    pub initialblockdownload: bool,
-    pub pruned: bool,
-}
-
-#[derive(Deserialize)]
-pub struct EstimateSmartFeeResult {
-    /// Estimate fee rate in BTC/kB.
-    #[serde(
-        default,
-        rename = "feerate",
-        skip_serializing_if = "Option::is_none",
-        with = "bitcoin::amount::serde::as_btc::opt"
-    )]
-    pub fee_rate: Option<Amount>,
-}
-
-#[derive(Deserialize)]
-pub struct GetNetworkInfoResult {
-    #[serde(rename = "relayfee", with = "bitcoin::amount::serde::as_btc")]
-    pub relay_fee: Amount,
-}
-
-#[derive(Deserialize)]
-pub struct GetMempoolInfoResult {
-    /// True if the mempool is fully loaded
-    pub loaded: Option<bool>,
+fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
+    match client.get_blockchain_info() {
+        Ok(info) => {
+            if skip_block_download_wait {
+                // bitcoind RPC is available, don't wait for block download to finish
+                return PollResult::Done(Ok(()));
+            }
+            let left_blocks = info.headers - info.blocks;
+            if info.initial_block_download || left_blocks > 0 {
+                info!(
+                    "waiting for {} blocks to download{}",
+                    left_blocks,
+                    if info.initial_block_download {
+                        " (IBD)"
+                    } else {
+                        ""
+                    }
+                );
+                return PollResult::Retry;
+            }
+            PollResult::Done(Ok(()))
+        }
+        Err(err) => {
+            if let Some(e) = extract_bitcoind_error(&err) {
+                if e.code == -28 {
+                    debug!("waiting for RPC warmup: {}", e.message);
+                    return PollResult::Retry;
+                }
+            }
+            PollResult::Done(Err(err).context("daemon not available"))
+        }
+    }
 }
 
 fn read_cookie(path: &Path) -> Result<(String, String)> {
@@ -88,38 +78,44 @@ fn read_cookie(path: &Path) -> Result<(String, String)> {
     Ok((parts[0].to_owned(), parts[1].to_owned()))
 }
 
-fn jsonrpc_client(config: &Config) -> Result<jsonrpc::Client> {
+fn rpc_connect(config: &Config) -> Result<Client> {
     let rpc_url = format!("http://{}", config.daemon_rpc_addr);
-    // Allow RPC calls to take longer before timing out.
+    // Allow `wait_for_new_block` to take a bit longer before timing out.
     // See https://github.com/romanz/electrs/issues/495 for more details.
     let builder = jsonrpc::simple_http::SimpleHttpTransport::builder()
         .url(&rpc_url)?
         .timeout(config.jsonrpc_timeout);
     let builder = match config.daemon_auth.get_auth() {
+        Auth::None => builder,
         Auth::UserPass(user, pass) => builder.auth(user, Some(pass)),
         Auth::CookieFile(path) => {
             let (user, pass) = read_cookie(&path)?;
             builder.auth(user, Some(pass))
         }
     };
-    Ok(jsonrpc::Client::with_transport(builder.build()))
+    Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+        builder.build(),
+    )))
 }
 
 pub struct Daemon {
-    client: jsonrpc::Client,
+    p2p: Mutex<Connection>,
+    rpc: Client,
 }
 
 impl Daemon {
-    pub(crate) fn connect(config: &Config, exit_flag: &ExitFlag) -> Result<Self> {
-        let daemon = Daemon {
-            client: jsonrpc_client(config)?,
-        };
+    pub(crate) fn connect(
+        config: &Config,
+        exit_flag: &ExitFlag,
+        metrics: &Metrics,
+    ) -> Result<Self> {
+        let mut rpc = rpc_connect(config)?;
 
         loop {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match daemon.rpc_poll(config.skip_block_download_wait) {
+            match rpc_poll(&mut rpc, config.skip_block_download_wait) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
@@ -130,85 +126,34 @@ impl Daemon {
             }
         }
 
-        Ok(daemon)
-    }
-
-    fn call<T: for<'a> serde::de::Deserialize<'a>>(
-        &self,
-        cmd: &str,
-        args: &[serde_json::Value],
-    ) -> Result<T, jsonrpc::Error> {
-        let raw = serde_json::value::to_raw_value(args)?;
-        let req = self.client.build_request(cmd, Some(&*raw));
-        let resp = self.client.send_request(req)?;
-        resp.result()
-    }
-
-    fn batch_request<T>(&self, name: &str, items: &[T]) -> Result<Vec<Option<jsonrpc::Response>>>
-    where
-        T: Serialize,
-    {
-        debug!("calling {} on {} items", name, items.len());
-        let args: Vec<Box<RawValue>> = items
-            .iter()
-            .map(|item| jsonrpc::try_arg([item]).context("failed to serialize into JSON"))
-            .collect::<Result<Vec<_>>>()?;
-        let reqs: Vec<jsonrpc::Request> = args
-            .iter()
-            .map(|arg| self.client.build_request(name, Some(arg)))
-            .collect();
-        match self.client.send_batch(&reqs) {
-            Ok(values) => {
-                assert_eq!(items.len(), values.len());
-                Ok(values)
-            }
-            Err(err) => bail!("batch {} request failed: {}", name, err),
+        let network_info = rpc.get_network_info()?;
+        if network_info.version < 21_00_00 {
+            bail!("electrs requires bitcoind 0.21+");
         }
-    }
-
-    fn rpc_poll(&self, skip_block_download_wait: bool) -> PollResult {
-        match self.call::<GetBlockchainInfoResult>("getblockchaininfo", &[]) {
-            Ok(info) => {
-                if info.pruned {
-                    return PollResult::Done(Err(anyhow!(
-                        "electrs requires non-pruned bitcoind node"
-                    )));
-                }
-                if skip_block_download_wait {
-                    // bitcoind RPC is available, don't wait for block download to finish
-                    return PollResult::Done(Ok(()));
-                }
-                let left_blocks = info.headers - info.blocks;
-                if info.initialblockdownload || left_blocks > 0 {
-                    info!(
-                        "waiting for {} blocks to download{}",
-                        left_blocks,
-                        if info.initialblockdownload {
-                            " (IBD)"
-                        } else {
-                            ""
-                        }
-                    );
-                    return PollResult::Retry;
-                }
-                PollResult::Done(Ok(()))
-            }
-            Err(err) => {
-                if let Some(e) = extract_bitcoind_error(&err) {
-                    if e.code == -28 {
-                        debug!("waiting for RPC warmup: {}", e.message);
-                        return PollResult::Retry;
-                    }
-                }
-                PollResult::Done(Err(err).context("daemon not available"))
-            }
+        if !network_info.network_active {
+            bail!("electrs requires active bitcoind p2p network");
         }
+        let info = rpc.get_blockchain_info()?;
+        if info.pruned {
+            bail!("electrs requires non-pruned bitcoind node");
+        }
+
+        let p2p = Mutex::new(Connection::connect(
+            config.network,
+            config.daemon_p2p_addr,
+            metrics,
+            config.signet_magic,
+        )?);
+        Ok(Self { p2p, rpc })
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
-        let res =
-            self.call::<EstimateSmartFeeResult>("estimatesmartfee", &[json!(nblocks), Value::Null]);
-        if let Err(jsonrpc::Error::Rpc(jsonrpc::error::RpcError { code: -32603, .. })) = res {
+        let res = self.rpc.estimate_smart_fee(nblocks, None);
+        if let Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(RpcError {
+            code: -32603,
+            ..
+        }))) = res
+        {
             return Ok(None); // don't fail when fee estimation is disabled (e.g. with `-blocksonly=1`)
         }
         Ok(res.context("failed to estimate fee")?.fee_rate)
@@ -216,64 +161,84 @@ impl Daemon {
 
     pub(crate) fn get_relay_fee(&self) -> Result<Amount> {
         Ok(self
-            .call::<GetNetworkInfoResult>("getnetworkinfo", &[])
+            .rpc
+            .get_network_info()
             .context("failed to get relay fee")?
             .relay_fee)
     }
 
     pub(crate) fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-        self.call("sendrawtransaction", &[json!(serialize_hex(tx))])
+        self.rpc
+            .send_raw_transaction(tx)
             .context("failed to broadcast transaction")
     }
 
-    pub(crate) fn submitpackage(&self, txs: &[Transaction]) -> Result<Value> {
-        let package: Vec<String> = txs.iter().map(serialize_hex).collect();
-        self.call("submitpackage", &[json!(package)])
-            .context("failed to submitpackage package")
+    pub(crate) fn get_transaction_info(
+        &self,
+        txid: &Txid,
+        blockhash: Option<BlockHash>,
+    ) -> Result<Value> {
+        // No need to parse the resulting JSON, just return it as-is to the client.
+        self.rpc
+            .call(
+                "getrawtransaction",
+                &[json!(txid), json!(true), json!(blockhash)],
+            )
+            .context("failed to get transaction info")
+    }
+
+    pub(crate) fn get_transaction_hex(
+        &self,
+        txid: &Txid,
+        blockhash: Option<BlockHash>,
+    ) -> Result<Value> {
+        use bitcoin::consensus::serde::{hex::Lower, Hex, With};
+
+        let tx = self.get_transaction(txid, blockhash)?;
+        #[derive(serde::Serialize)]
+        #[serde(transparent)]
+        struct TxAsHex(#[serde(with = "With::<Hex<Lower>>")] Transaction);
+        serde_json::to_value(TxAsHex(tx)).map_err(Into::into)
     }
 
     pub(crate) fn get_transaction(
         &self,
         txid: &Txid,
         blockhash: Option<BlockHash>,
-        verbose: bool,
-    ) -> Result<Value> {
-        self.call(
-            "getrawtransaction",
-            &[json!(txid), json!(verbose), json!(blockhash)],
-        )
-        .context("failed to get transaction")
+    ) -> Result<Transaction> {
+        self.rpc
+            .get_raw_transaction(txid, blockhash.as_ref())
+            .context("failed to get transaction")
     }
 
     pub(crate) fn get_block_txids(&self, blockhash: BlockHash) -> Result<Vec<Txid>> {
-        #[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
-        struct GetBlockResult {
-            pub tx: Vec<bitcoin::Txid>,
-        }
-        let res: GetBlockResult = self
-            .call("getblock", &[json!(blockhash), json!(1)])
-            .context("failed to get block txids")?;
-        Ok(res.tx)
+        Ok(self
+            .rpc
+            .get_block_info(&blockhash)
+            .context("failed to get block txids")?
+            .tx)
     }
 
-    pub(crate) fn get_mempool_info(&self) -> Result<GetMempoolInfoResult> {
-        self.call("getmempoolinfo", &[])
+    pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {
+        self.rpc
+            .get_mempool_info()
             .context("failed to get mempool info")
     }
 
     pub(crate) fn get_mempool_txids(&self) -> Result<Vec<Txid>> {
-        self.call("getrawmempool", &[])
+        self.rpc
+            .get_raw_mempool()
             .context("failed to get mempool txids")
     }
 
     pub(crate) fn get_mempool_entries(
         &self,
         txids: &[Txid],
-    ) -> Result<Vec<Option<GetMempoolEntryResult>>> {
-        let results = self.batch_request("getmempoolentry", txids)?;
+    ) -> Result<Vec<Option<json::GetMempoolEntryResult>>> {
+        let results = batch_request(self.rpc.get_jsonrpc_client(), "getmempoolentry", txids)?;
         Ok(results
             .into_iter()
-            .map(|r| match r?.result::<GetMempoolEntryResult>() {
+            .map(|r| match r?.result::<json::GetMempoolEntryResult>() {
                 Ok(entry) => Some(entry),
                 Err(err) => {
                     debug!("failed to get mempool entry: {}", err); // probably due to RBF
@@ -287,7 +252,7 @@ impl Daemon {
         &self,
         txids: &[Txid],
     ) -> Result<Vec<Option<Transaction>>> {
-        let results = self.batch_request("getrawtransaction", txids)?;
+        let results = batch_request(self.rpc.get_jsonrpc_client(), "getrawtransaction", txids)?;
         Ok(results
             .into_iter()
             .map(|r| -> Option<Transaction> {
@@ -315,11 +280,58 @@ impl Daemon {
             })
             .collect())
     }
+
+    pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
+        self.p2p.lock().get_new_headers(chain)
+    }
+
+    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    where
+        B: IntoIterator<Item = BlockHash>,
+        F: FnMut(BlockHash, SerBlock),
+    {
+        self.p2p.lock().for_blocks(blockhashes, func)
+    }
+
+    pub(crate) fn new_block_notification(&self) -> Receiver<()> {
+        self.p2p.lock().new_block_notification()
+    }
 }
 
-pub(crate) fn extract_bitcoind_error(err: &jsonrpc::Error) -> Option<&jsonrpc::error::RpcError> {
+pub(crate) type RpcError = bitcoincore_rpc::jsonrpc::error::RpcError;
+
+pub(crate) fn extract_bitcoind_error(err: &bitcoincore_rpc::Error) -> Option<&RpcError> {
+    use bitcoincore_rpc::{
+        jsonrpc::error::Error::Rpc as ServerError, Error::JsonRpc as JsonRpcError,
+    };
     match err {
-        jsonrpc::error::Error::Rpc(e) => Some(e),
+        JsonRpcError(ServerError(e)) => Some(e),
         _ => None,
+    }
+}
+
+fn batch_request<T>(
+    client: &jsonrpc::Client,
+    name: &str,
+    items: &[T],
+) -> Result<Vec<Option<jsonrpc::Response>>>
+where
+    T: Serialize,
+{
+    debug!("calling {} on {} items", name, items.len());
+    let args: Vec<Box<RawValue>> = items
+        .iter()
+        .map(|item| jsonrpc::try_arg([item]).context("failed to serialize into JSON"))
+        .collect::<Result<Vec<_>>>()?;
+    let reqs: Vec<jsonrpc::Request> = args
+        .iter()
+        .map(|arg| client.build_request(name, Some(arg)))
+        .collect();
+    match client.send_batch(&reqs) {
+        Ok(values) => {
+            assert_eq!(items.len(), values.len());
+            Ok(values)
+        }
+        Err(err) => bail!("batch {} request failed: {}", name, err),
     }
 }

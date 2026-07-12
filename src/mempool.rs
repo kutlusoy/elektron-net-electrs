@@ -5,15 +5,15 @@ use std::convert::TryFrom;
 use std::iter::FromIterator;
 use std::ops::Bound;
 
-use crate::bitcoin::hashes::Hash;
-use crate::bitcoin::{Amount, OutPoint, Transaction, Txid};
-use bindex::ScriptHash;
+use bitcoin::hashes::Hash;
+use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
 use crate::{
     daemon::Daemon,
     metrics::{Gauge, Metrics},
     signals::ExitFlag,
+    types::ScriptHash,
 };
 
 pub(crate) struct Entry {
@@ -80,7 +80,7 @@ impl MempoolSyncUpdate {
             );
             let chunk_entries: Vec<Entry> = txids_chunk
                 .iter()
-                .zip(entries.into_iter().zip(txs))
+                .zip(entries.into_iter().zip(txs.into_iter()))
                 .filter_map(|(txid, (entry, tx))| {
                     let entry = match entry {
                         Some(entry) => entry,
@@ -368,7 +368,7 @@ impl Serialize for FeeHistogram {
 #[cfg(test)]
 mod tests {
     use super::FeeHistogram;
-    use crate::bitcoin::Amount;
+    use bitcoin::Amount;
     use serde_json::json;
 
     #[test]

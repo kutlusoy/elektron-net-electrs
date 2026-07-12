@@ -1,51 +1,78 @@
-use crate::bitcoin::{BlockHash, Txid};
-use crate::bitcoin_slices::{bsl, EmptyVisitor, Visit};
+use std::ops::ControlFlow;
+
 use anyhow::{Context, Result};
-use bindex::IndexedChain;
+use bitcoin::{BlockHash, Txid};
+use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
 
 use crate::{
+    cache::Cache,
+    chain::Chain,
     config::Config,
     daemon::Daemon,
+    db::DBStore,
+    index::Index,
     mempool::{FeeHistogram, Mempool},
     metrics::Metrics,
     signals::ExitFlag,
     status::{Balance, ScriptHashStatus, UnspentEntry},
+    types::bsl_txid,
 };
 
 /// Electrum protocol subscriptions' tracker
 pub struct Tracker {
-    index: IndexedChain,
+    index: Index,
     mempool: Mempool,
+    metrics: Metrics,
     ignore_mempool: bool,
+}
+
+pub(crate) enum Error {
+    NotReady,
 }
 
 impl Tracker {
     pub fn new(config: &Config, metrics: Metrics) -> Result<Self> {
-        let index =
-            IndexedChain::open(&config.db_dir, config.network).context("failed to open index")?;
+        let store = DBStore::open(
+            &config.db_path,
+            config.db_log_dir.as_deref(),
+            config.auto_reindex,
+            config.db_parallelism,
+        )?;
+        let chain = Chain::new(config.network);
         Ok(Self {
-            index,
+            index: Index::load(
+                store,
+                chain,
+                &metrics,
+                config.index_batch_size,
+                config.index_lookup_limit,
+                config.reindex_last_blocks,
+            )
+            .context("failed to open index")?,
             mempool: Mempool::new(&metrics),
+            metrics,
             ignore_mempool: config.ignore_mempool,
         })
     }
 
-    pub(crate) fn headers(&self) -> &bindex::Headers {
-        self.index.headers()
+    pub(crate) fn chain(&self) -> &Chain {
+        self.index.chain()
     }
 
     pub(crate) fn fees_histogram(&self) -> &FeeHistogram {
         self.mempool.fees_histogram()
     }
 
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
     pub(crate) fn get_unspent(&self, status: &ScriptHashStatus) -> Vec<UnspentEntry> {
-        status.get_unspent()
+        status.get_unspent(self.index.chain())
     }
 
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
-        exit_flag.poll()?;
-        let stats = self.index.sync(1000)?;
-        let done = stats.indexed_blocks == 0;
+        let done = self.index.sync(daemon, exit_flag)?;
         if done && !self.ignore_mempool {
             self.mempool.sync(daemon, exit_flag);
             // TODO: double check tip - and retry on diff
@@ -53,36 +80,67 @@ impl Tracker {
         Ok(done)
     }
 
-    pub(crate) fn status(&self) -> Result<()> {
-        Ok(())
+    pub(crate) fn status(&self) -> Result<(), Error> {
+        if self.index.is_ready() {
+            return Ok(());
+        }
+        Err(Error::NotReady)
     }
 
-    pub(crate) fn update_scripthash_status(&self, status: &mut ScriptHashStatus) -> Result<bool> {
+    pub(crate) fn update_scripthash_status(
+        &self,
+        status: &mut ScriptHashStatus,
+        daemon: &Daemon,
+        cache: &Cache,
+    ) -> Result<bool> {
         let prev_statushash = status.statushash();
-        status.sync(&self.index, &self.mempool)?;
+        status.sync(&self.index, &self.mempool, daemon, cache)?;
         Ok(prev_statushash != status.statushash())
     }
 
     pub(crate) fn get_balance(&self, status: &ScriptHashStatus) -> Balance {
-        status.get_balance()
+        status.get_balance(self.chain())
     }
 
-    pub(crate) fn lookup_transaction(&self, txid: Txid) -> Result<Option<(BlockHash, Box<[u8]>)>> {
+    pub(crate) fn lookup_transaction(
+        &self,
+        daemon: &Daemon,
+        txid: Txid,
+    ) -> Result<Option<(BlockHash, Box<[u8]>)>> {
         // Note: there are two blocks with coinbase transactions having same txid (see BIP-30)
-        for loc in self.index.locations_by_txid(&txid)? {
-            let tx_bytes = self.index.get_tx_bytes(&loc)?;
-            if txid == compute_txid(&tx_bytes)? {
-                return Ok(Some((loc.block_hash(), tx_bytes.into_boxed_slice())));
+        let blockhashes = self.index.filter_by_txid(txid);
+        let mut result = None;
+        daemon.for_blocks(blockhashes, |blockhash, block| {
+            if result.is_some() {
+                return; // keep first matching transaction
             }
-        }
-        Ok(None)
+            let mut visitor = FindTransaction::new(txid);
+            result = match bsl::Block::visit(&block, &mut visitor) {
+                Ok(_) | Err(VisitBreak) => visitor.found.map(|tx| (blockhash, tx)),
+                Err(e) => panic!("core returned invalid block: {:?}", e),
+            };
+        })?;
+        Ok(result)
     }
 }
 
-fn compute_txid(tx_bytes: &[u8]) -> Result<Txid> {
-    let mut visit = EmptyVisitor {};
-    let res = bsl::Transaction::visit(tx_bytes, &mut visit)
-        .map_err(|err| anyhow!("invalid transaction: {:?}", err))?;
-    ensure!(res.remaining().is_empty(), "non-empty remaining bytes");
-    Ok(Txid::from_raw_hash(res.parsed().txid()))
+pub struct FindTransaction {
+    txid: bitcoin::Txid,
+    found: Option<Box<[u8]>>, // no need to deserialize
+}
+
+impl FindTransaction {
+    pub fn new(txid: bitcoin::Txid) -> Self {
+        Self { txid, found: None }
+    }
+}
+impl Visitor for FindTransaction {
+    fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
+        if self.txid == bsl_txid(tx) {
+            self.found = Some(tx.as_ref().into());
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
 }

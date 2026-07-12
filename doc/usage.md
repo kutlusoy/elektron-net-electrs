@@ -21,7 +21,7 @@ $ du -ch ~/.bitcoin/blocks/blk*.dat | tail -n1
 336G  total
 
 $ ./target/release/electrs --network bitcoin --db-dir ./db --daemon-dir /home/user/.bitcoin
-Starting electrs 0.10.0 on x86_64 linux with Config { network: Bitcoin, db_path: "./db/bitcoin", daemon_dir: "/home/user/.bitcoin", daemon_auth: CookieFile("/home/user/.bitcoin/.cookie"), daemon_rpc_addr: 127.0.0.1:8332, electrum_rpc_addr: 127.0.0.1:50001, monitoring_addr: 127.0.0.1:4224, wait_duration: 10s, jsonrpc_timeout: 15s, index_lookup_limit: None, reindex_last_blocks: 0, auto_reindex: true, ignore_mempool: false, sync_once: false, skip_block_download_wait: false, disable_electrum_rpc: false, server_banner: "Welcome to electrs 0.10.0 (Electrum Rust Server)!", magic: f9beb4d9, args: [] }
+Starting electrs 0.10.0 on x86_64 linux with Config { network: Bitcoin, db_path: "./db/bitcoin", daemon_dir: "/home/user/.bitcoin", daemon_auth: CookieFile("/home/user/.bitcoin/.cookie"), daemon_rpc_addr: 127.0.0.1:8332, daemon_p2p_addr: 127.0.0.1:8333, electrum_rpc_addr: 127.0.0.1:50001, monitoring_addr: 127.0.0.1:4224, wait_duration: 10s, jsonrpc_timeout: 15s, index_batch_size: 10, index_lookup_limit: None, reindex_last_blocks: 0, auto_reindex: true, ignore_mempool: false, sync_once: false, skip_block_download_wait: false, disable_electrum_rpc: false, server_banner: "Welcome to electrs 0.10.0 (Electrum Rust Server)!", signet_magic: f9beb4d9, args: [] }
 [2023-08-16T19:17:11.193Z INFO  electrs::metrics::metrics_impl] serving Prometheus metrics on 127.0.0.1:4224
 [2023-08-16T19:17:11.193Z INFO  electrs::server] serving Electrum RPC on 127.0.0.1:50001
 [2023-08-16T19:17:12.355Z INFO  electrs::db] "./db/bitcoin": 0 SST files, 0 GB, 0 Grows
@@ -71,7 +71,7 @@ See [extra configuration suggestions](config.md#extra-configuration-suggestions)
 
 ## Electrum client
 
-If you happen to use the Electrum client from [the *beta* Debian repository](binaries.md#native-os-packages), it's pre-configured out-of-the-box already
+If you happen to use the Electrum client from [the *beta* Debian repository](binaries.md#cnative-os-packages), it's pre-configured out-of-the-box already
 Read below otherwise.
 
 There's a prepared script for launching `electrum` in such way to connect only to the local `electrs` instance to protect your privacy.
@@ -101,8 +101,8 @@ $ echo '{"jsonrpc": "2.0", "method": "server.version", "params": ["", "1.4"], "i
 {"id":0,"jsonrpc":"2.0","result":["electrs 0.9.0","1.4"]}
 ```
 
-For more complex tasks, you may need to convert addresses to
-[script hashes](https://electrum-protocol.readthedocs.io/en/latest/protocol-basics.html#script-hashes) - see
+For more complex tasks, you may need to convert addresses to 
+[script hashes](https://electrumx-spesmilo.readthedocs.io/en/latest/protocol-basics.html#script-hashes) - see 
 [contrib/history.py](https://github.com/romanz/electrs/blob/master/contrib/history.py) for getting an address balance and history:
 
 ```
