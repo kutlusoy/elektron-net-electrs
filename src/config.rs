@@ -17,6 +17,10 @@ pub const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SERVER_ADDRESS: [u8; 4] = [127, 0, 0, 1]; // by default, serve on IPv4 localhost
 
 mod internal {
+    // The generated code triggers rustc/clippy lints on newer toolchains
+    // (e.g. `#[automatically_derived]` on inherent impls); CI runs with
+    // `-D warnings`, so silence them here (upstream did the same in 0.11).
+    #![allow(unused_attributes, unused_imports, clippy::enum_variant_names)]
     include!(concat!(env!("OUT_DIR"), "/configure_me_config.rs"));
 }
 

@@ -5,8 +5,16 @@ rm -rf data/
 mkdir -p data/{bitcoin,electrum,electrs}
 
 cleanup() {
+  status=$?
   trap - SIGTERM SIGINT
   set +e +o pipefail
+  # On failure, surface the electrs log - otherwise CI only shows the
+  # secondary symptom (e.g. a refused connection), not the actual error.
+  if [ "$status" -ne 0 ] && [ -f data/electrs/regtest-debug.log ]; then
+    echo "=== test failed (exit $status), electrs log follows ==="
+    tail -n 100 data/electrs/regtest-debug.log
+    echo "=== end of electrs log ==="
+  fi
   jobs
   for j in `jobs -rp`
   do
