@@ -174,22 +174,79 @@ independent node operators.
 ## Status
 
 - [x] Snapshot parser (`src/snapshot.rs`): VARINT, amount compression, script
-      compression, `SnapshotMetadata` and coin-entry reader. Written, not yet
-      compiled anywhere (see caveat below).
-- [ ] `SNAPSHOT_UNSPENT_CF` schema and write path
-- [ ] Bootstrap trigger in `Index::load()`
-- [ ] `Unspent::build()` integration
+      compression, `SnapshotMetadata` and coin-entry reader.
+- [x] `SNAPSHOT_UNSPENT_CF` schema (`SnapshotUnspentRow` in `src/types.rs`)
+      and write path (`DBStore::write_snapshot_bootstrap()`,
+      `get_bootstrap_height()` in `src/db.rs`).
+- [x] `Daemon::dump_txoutset()` (`src/daemon.rs`), new `utxo_snapshot_dir`
+      config option (`internal/config_specification.toml`, `src/config.rs`).
+- [x] Bootstrap trigger: `Index::bootstrap()`, called from the top of
+      `Index::sync()` on a fresh DB when `utxo_snapshot_dir` is set
+      (`src/index.rs`). `index_blocks()` now skips the P2P body fetch for
+      any height at or below the bootstrap height, recording only the
+      header (already available from the body-independent `getheaders`
+      walk, see `NewHeader::header()` in `src/chain.rs`) -- fixed a
+      self-found bug here where an all-header chunk left the batch's tip
+      marker at all-zeros instead of the chunk's actual last hash.
+- [x] `Unspent::build()` integration (`src/status.rs`): folds in
+      `Index::get_snapshot_unspent()` entries before the normal
+      confirmed/mempool folding; `ScriptHashStatus::sync()` now also seeds
+      these outpoints into its spending-detection set, so a later spend of
+      a bootstrap-seeded UTXO is still detected through the ordinary
+      `SPENDING_CF` path.
 - [x] Sub-encoding unit tests written (VARINT, amount round-trip, P2PKH/P2SH
       reconstruction), hand-verified on paper; not yet run (see caveat below)
-- [ ] **Blocking:** compile and run `cargo test` for `src/snapshot.rs` on a
-      machine with real network access. The environment this was written in
-      cannot fetch crate contents from `static.crates.io` (only the sparse
-      index is reachable through its network policy), so `cargo check`/`cargo
-      test` could not be run here at all -- this code has had a careful
-      manual review but zero compiler or test-runner feedback so far. Do not
-      treat it as verified until it has actually built and the tests above
-      have actually run.
-- [ ] **Blocking:** validate parser against a real `dumptxoutset` fixture
-      from an actual node before this is trusted
+- [x] **Blocking (resolved):** built and run on a real machine (Docker,
+      WSL2 Ubuntu regtest), not just this environment -- four real
+      compiler/runtime issues surfaced and got fixed one at a time:
+      `bitcoin::io::Read` vs `std::io::Read` for `consensus_decode()`;
+      `dumptxoutset` needing an explicit `"latest"` type argument; a P2P
+      network-magic mismatch (`signet_magic` unset, defaulted to stock
+      testnet magic); and a `/snapshot` bind-mount permission issue in the
+      daemon container's entrypoint. All fixed and pushed.
+- [x] **Blocking (resolved):** validated against a live `dumptxoutset`
+      fixture, not a synthetic one -- 800-block Elektron Net regtest,
+      `fastprune` forcing real file rollover/pruning (`pruneheight: 649`
+      confirmed), bootstrap wrote 800 coins at height 800. Cross-checked
+      `blockchain.scripthash.listunspent`/`get_balance` against the node
+      wallet's own `listunspent` for a real address: 500 UTXOs, summed sats
+      match `get_balance.confirmed` exactly (33484375000), 349 of those 500
+      entries sit at heights already pruned on the node. `get_history`
+      correctly returns `[]` for the bootstrap period (no crash, no bogus
+      entries).
+- [x] Prune-gap resilience: what happens if electrs is offline across one or
+      more *further* automatic-pruning checkpoints, so the daemon prunes
+      block bodies between electrs' last-known tip and its new prune floor
+      before electrs ever gets to index them? Found live (simulated: stopped
+      electrs at tip 800, generated 1250 more blocks on the node, restarted
+      electrs) that the old code would have tried `daemon.for_blocks()` for
+      already-pruned heights; the daemon replies `notfound`, which
+      `src/p2p.rs`'s message parser doesn't otherwise handle (`_ =>
+      bail!("unsupported message...")`), killing the P2P connection and
+      crashing electrs. Fixed: `Daemon::get_prune_height()` (new, reads
+      `getblockchaininfo`'s `pruneheight`) plus `Index::ensure_no_prune_gap()`
+      (new, called at the top of every `sync()` before indexing) detect a gap
+      between the daemon's current prune floor and our last-covered height
+      and re-run the §3.2 bootstrap to close it, capturing the UTXO set fresh
+      as of now rather than ever attempting a doomed body fetch.
+      `DBStore::write_snapshot_bootstrap()` now clears previously-written
+      `SNAPSHOT_UNSPENT_CF` rows before writing the new ones, since a second
+      bootstrap run must not leave stale entries for coins spent between the
+      two snapshots. Without `utxo_snapshot_dir` configured, the same gap now
+      fails with a clear, actionable error instead of the opaque P2P crash.
+      Live-verified end to end: the gap detection fired exactly as designed
+      (log: "daemon pruned past our last covered height (800 -> 1945),
+      re-running the UTXO-snapshot bootstrap to close the gap"). That first
+      re-test surfaced a second, smaller bug: `dumptxoutset` refuses to
+      overwrite an existing output file, and the first bootstrap's leftover
+      `electrs-bootstrap.dat` was still sitting on the shared mount, failing
+      the second run. Fixed: `Index::bootstrap()` now removes any stale
+      snapshot file at that path before calling `dumptxoutset` again.
+      Re-tested after that fix: second bootstrap wrote 2072 coins at height
+      2072, all 1272 pending blocks (801-2072) correctly indexed as
+      header-only (zero funding/spending rows per chunk, zero P2P body
+      fetches attempted), chain advanced cleanly to tip height 2072, stable
+      steady-state polling afterwards with no crash and no hang.
 - [ ] Genesis-sync vs. bootstrap-sync equivalence integration test
-- [ ] Decide `dumptxoutset` vs. shared snapshot file (deployment question above)
+- [x] Decide `dumptxoutset` vs. shared snapshot file (deployment question
+      above): went with `dumptxoutset` for the first cut, as planned.

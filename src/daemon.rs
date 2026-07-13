@@ -41,6 +41,9 @@ struct BlockchainInfo {
     #[serde(rename = "initialblockdownload")]
     initial_block_download: bool,
     pruned: bool,
+    // Absent when `pruned` is false.
+    #[serde(default)]
+    pruneheight: Option<u32>,
 }
 
 fn get_blockchain_info(client: &Client) -> bitcoincore_rpc::Result<BlockchainInfo> {
@@ -315,6 +318,48 @@ impl Daemon {
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
         self.p2p.lock().get_new_headers(chain)
+    }
+
+    /// The daemon's current prune floor (`getblockchaininfo`'s `pruneheight`):
+    /// block bodies at or below this height are gone, network-wide. `None`
+    /// when the daemon isn't pruned at all (never true on Elektron Net, but
+    /// checked rather than assumed).
+    pub(crate) fn get_prune_height(&self) -> Result<Option<u32>> {
+        let info = get_blockchain_info(&self.rpc).context("getblockchaininfo failed")?;
+        Ok(info.pruneheight)
+    }
+
+    /// Calls `dumptxoutset` on the daemon to produce a UTXO-snapshot file at
+    /// `path` (§3.2 bootstrap, see `doc/utxo-snapshot-bootstrap-plan.md`).
+    /// `path` is resolved from the *daemon's* filesystem -- it must be
+    /// reachable there for the RPC to succeed, and the same path (or an
+    /// equivalent one through a shared mount) must be readable from here
+    /// afterwards for `crate::snapshot` to parse the result. Returns the
+    /// snapshot's base block height and hash, straight from the RPC
+    /// response, for the caller to cross-check against the file's own
+    /// metadata header.
+    pub(crate) fn dump_txoutset(&self, path: &Path) -> Result<(u32, BlockHash)> {
+        let path_str = path.to_str().context("non-UTF8 snapshot path")?;
+        // "latest": snapshot the UTXO set as of the current tip. The other
+        // accepted value, "rollback", would roll the node's state back to
+        // an older block first -- not what bootstrap needs, and considerably
+        // slower on a real chain.
+        let response: Value = self
+            .rpc
+            .call("dumptxoutset", &[json!(path_str), json!("latest")])
+            .context("dumptxoutset RPC failed")?;
+        let base_height = response
+            .get("base_height")
+            .and_then(Value::as_u64)
+            .context("dumptxoutset response missing base_height")?;
+        let base_height = u32::try_from(base_height).context("base_height out of range")?;
+        let base_hash: BlockHash = response
+            .get("base_hash")
+            .and_then(Value::as_str)
+            .context("dumptxoutset response missing base_hash")?
+            .parse()
+            .context("dumptxoutset response has invalid base_hash")?;
+        Ok((base_height, base_hash))
     }
 
     pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>

@@ -169,8 +169,24 @@ struct Unspent {
 }
 
 impl Unspent {
-    fn build(status: &ScriptHashStatus, chain: &Chain) -> Self {
+    fn build(status: &ScriptHashStatus, index: &Index) -> Self {
+        let chain = index.chain();
         let mut unspent = Unspent::default();
+
+        // §3.2 bootstrap-seeded unspent outputs (see
+        // doc/utxo-snapshot-bootstrap-plan.md): self-contained, the amount
+        // comes straight from the snapshot, no re-fetch of a (long-gone)
+        // historical block needed. Added before the normal folding below so
+        // a later spend -- detected the ordinary way, since
+        // ScriptHashStatus::sync() seeds these same outpoints into its
+        // spending-detection set -- correctly removes them same as any
+        // other outpoint.
+        for (outpoint, value, height) in index.get_snapshot_unspent(status.scripthash) {
+            unspent
+                .outpoints
+                .insert(outpoint, (Amount::from_sat(value), height));
+        }
+
         // First, add all relevant entries' funding outputs to the outpoints' map
         status
             .confirmed_height_entries(chain)
@@ -270,13 +286,13 @@ impl ScriptHashStatus {
     }
 
     /// Collect unspent transaction entries
-    pub(crate) fn get_unspent(&self, chain: &Chain) -> Vec<UnspentEntry> {
-        Unspent::build(self, chain).into_entries()
+    pub(crate) fn get_unspent(&self, index: &Index) -> Vec<UnspentEntry> {
+        Unspent::build(self, index).into_entries()
     }
 
     /// Collect unspent transaction balance
-    pub(crate) fn get_balance(&self, chain: &Chain) -> Balance {
-        Unspent::build(self, chain).balance
+    pub(crate) fn get_balance(&self, index: &Index) -> Balance {
+        Unspent::build(self, index).balance
     }
 
     /// Collect transaction history entries
@@ -431,6 +447,17 @@ impl ScriptHashStatus {
         cache: &Cache,
     ) -> Result<()> {
         let mut outpoints: HashSet<OutPoint> = self.confirmed_outpoints(index.chain());
+        // §3.2 bootstrap-seeded outpoints need to be in this set too, or a
+        // later spend of one would never be looked up via
+        // `index.filter_by_spending()` below in `sync_confirmed()` -- they
+        // never go through the normal "funding transaction discovered" path
+        // that would otherwise add them here.
+        outpoints.extend(
+            index
+                .get_snapshot_unspent(self.scripthash)
+                .into_iter()
+                .map(|(outpoint, _value, _height)| outpoint),
+        );
 
         let new_tip = index.chain().tip();
         if self.tip != new_tip {

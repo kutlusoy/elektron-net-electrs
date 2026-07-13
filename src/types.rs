@@ -197,6 +197,65 @@ pub(crate) fn bsl_txid(tx: &bsl::Transaction) -> Txid {
     bitcoin::Txid::from_slice(tx.txid_sha2().as_slice()).expect("invalid txid")
 }
 
+// ***************************************************************************
+
+/// A single unspent output seeded from a §3.2 UTXO-snapshot bootstrap (see
+/// `src/snapshot.rs` and `doc/utxo-snapshot-bootstrap-plan.md`). Unlike
+/// `FUNDING_CF`/`SPENDING_CF`, which are height pointers resolved by
+/// re-fetching the historical block, this row carries the amount directly,
+/// since the block it originated from is gone by the time bootstrap runs.
+pub(crate) type SerializedSnapshotUnspentRow = [u8; SNAPSHOT_UNSPENT_ROW_SIZE];
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct SnapshotUnspentRow {
+    pub(crate) prefix: HashPrefix, // scripthash prefix, for prefix-scan lookup
+    pub(crate) txid: Txid,
+    pub(crate) vout: u32,
+    pub(crate) value: u64, // amount, in satoshis
+    pub(crate) height: Height, // the coin's original confirmation height, from the snapshot
+}
+
+pub const SNAPSHOT_UNSPENT_ROW_SIZE: usize = HASH_PREFIX_LEN + 32 + 4 + 8 + HEIGHT_SIZE;
+
+impl_consensus_encoding!(SnapshotUnspentRow, prefix, txid, vout, value, height);
+
+impl SnapshotUnspentRow {
+    pub(crate) fn new(scripthash: ScriptHash, txid: Txid, vout: u32, value: u64, height: usize) -> Self {
+        Self {
+            prefix: scripthash.prefix(),
+            txid,
+            vout,
+            value,
+            height: Height::try_from(height).expect("invalid height"),
+        }
+    }
+
+    pub(crate) fn scan_prefix(scripthash: ScriptHash) -> HashPrefix {
+        scripthash.0[..HASH_PREFIX_LEN].try_into().unwrap()
+    }
+
+    pub(crate) fn to_db_row(&self) -> SerializedSnapshotUnspentRow {
+        let mut row = [0; SNAPSHOT_UNSPENT_ROW_SIZE];
+        let len = self
+            .consensus_encode(&mut (&mut row as &mut [u8]))
+            .expect("in-memory writers don't error");
+        debug_assert_eq!(len, SNAPSHOT_UNSPENT_ROW_SIZE);
+        row
+    }
+
+    pub(crate) fn from_db_row(row: SerializedSnapshotUnspentRow) -> Self {
+        deserialize(&row).expect("bad SnapshotUnspentRow")
+    }
+
+    pub(crate) fn outpoint(&self) -> OutPoint {
+        OutPoint::new(self.txid, self.vout)
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        usize::try_from(self.height).expect("invalid height")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::types::{spending_prefix, HashPrefixRow, ScriptHash, ScriptHashRow, TxidRow};
