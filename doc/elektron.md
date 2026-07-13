@@ -60,10 +60,23 @@ protocol, so two Elektron Net specifics matter here:
   Net's genesis header (hash
   `00000006b054338443f1a5d5534df21eab0d13232028158ae198edbb169f9dad`, built
   from the chainparams.cpp constants and self-checked at startup) instead of
-  rust-bitcoin's Bitcoin genesis — otherwise no header from `elektrond`
+  rust-bitcoin's Bitcoin genesis, since otherwise no header from `elektrond`
   could ever attach ("missing prev_blockhash"). Consequence: this binary
-  cannot index Bitcoin mainnet, and an Elektron *testnet* deployment would
-  need the analogous override for its own genesis first.
+  cannot index Bitcoin mainnet.
+
+  **Elektron Net regtest** gets the same treatment, but repurposing
+  `Network::Testnet` instead of `Network::Regtest`: this fork's own CI
+  integration test (`tests/run.sh`) runs electrs against a real, stock
+  `bitcoind` in regtest mode, so `Network::Regtest` has to keep meaning
+  actual Bitcoin regtest. Elektron's own regtest genesis (hash
+  `752eeff40cb87937e666970e00ffdca686f950c5feca8894d7714086848c6d4f`, same
+  merkle root as mainnet's genesis but Bitcoin's stock regtest
+  timestamp/nonce/bits and a 5 COIN instead of 50 COIN coinbase reward) is
+  seeded when `network = "testnet"` is configured. Point electrs at an
+  actual Elektron Net node running `-regtest` this way, not because it has
+  anything to do with a real testnet. An Elektron *testnet* (the actual
+  network, not this stand-in) deployment would still need its own separate
+  genesis override added first.
 
 ## Typed "block pruned" Electrum error (code 3)
 

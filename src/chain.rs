@@ -69,16 +69,55 @@ fn elektron_genesis_header() -> BlockHeader {
     header
 }
 
+/// Elektron Net *regtest* genesis header, built from `CRegTestParams` in
+/// elektron-net's `src/kernel/chainparams.cpp`. Elektron's regtest reuses
+/// Bitcoin's stock regtest timestamp/nonce/bits (1296688602 / 2 /
+/// 0x207fffff) but a different genesis coinbase reward (5 COIN, not 50),
+/// so the merkle root -- and therefore the genesis hash -- differs from
+/// stock Bitcoin regtest.
+///
+/// `Network::Regtest` itself is NOT repurposed for this (unlike
+/// `Network::Bitcoin` for mainnet above): this fork's own CI integration
+/// test (`tests/run.sh`) runs electrs against a real, stock `bitcoind` in
+/// regtest mode, and that needs the real Bitcoin regtest genesis to keep
+/// working. `Network::Testnet` is never used anywhere in this codebase or
+/// its CI, so it's repurposed as the Elektron-regtest stand-in instead --
+/// point electrs at it with `network = "testnet"` when testing against an
+/// actual Elektron Net node running `-regtest`, not because it has
+/// anything to do with a real testnet.
+fn elektron_regtest_genesis_header() -> BlockHeader {
+    use bitcoin::hashes::Hash;
+    let header = BlockHeader {
+        version: bitcoin::blockdata::block::Version::from_consensus(1),
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: "0a7087d81dfb14868848c7e02da8408fe721540e63f6cab9a67d0dfc37b19b17"
+            .parse()
+            .expect("valid Elektron regtest genesis merkle root"),
+        time: 1296688602,
+        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+        nonce: 2,
+    };
+    assert_eq!(
+        header.block_hash().to_string(),
+        "752eeff40cb87937e666970e00ffdca686f950c5feca8894d7714086848c6d4f",
+        "Elektron regtest genesis header constants are inconsistent with chainparams.cpp"
+    );
+    header
+}
+
 impl Chain {
     // create an empty chain
     pub fn new(network: Network) -> Self {
         let genesis_header = match network {
             // Elektron Net mainnet (Network::Bitcoin is its internal stand-in)
             Network::Bitcoin => elektron_genesis_header(),
-            // testnet/signet/regtest keep rust-bitcoin's genesis blocks, so
-            // the docker integration test still runs against a stock
-            // Bitcoin Core regtest. An Elektron *testnet* electrs would need
-            // its own genesis here first (different hash per chainparams.cpp).
+            // Elektron Net regtest (Network::Testnet is its internal
+            // stand-in -- see elektron_regtest_genesis_header() above for
+            // why Network::Regtest itself can't be repurposed here).
+            Network::Testnet => elektron_regtest_genesis_header(),
+            // signet/regtest keep rust-bitcoin's genesis blocks, so the CI
+            // docker integration test still runs against a stock Bitcoin
+            // Core regtest.
             _ => bitcoin::blockdata::constants::genesis_block(network).header,
         };
         let genesis_hash = genesis_header.block_hash();
