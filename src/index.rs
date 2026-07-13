@@ -205,9 +205,9 @@ impl Index {
     /// fresh as of *now*, so it always covers the gap regardless of how far
     /// behind we fell (not just the one-checkpoint case).
     fn ensure_no_prune_gap(&self, daemon: &Daemon, next_height: u32) -> Result<()> {
-        let Some(prune_height) = daemon.get_prune_height().context("get_prune_height failed")?
-        else {
-            return Ok(()); // daemon reports itself as not pruned
+        let prune_height = match daemon.get_prune_height().context("get_prune_height failed")? {
+            Some(prune_height) => prune_height,
+            None => return Ok(()), // daemon reports itself as not pruned
         };
         let bootstrap_height = self.store.get_bootstrap_height().unwrap_or(0);
         if prune_height <= bootstrap_height || next_height > prune_height {
