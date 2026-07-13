@@ -325,17 +325,28 @@ impl DBStore {
         Some(u32::from_le_bytes(bytes))
     }
 
-    /// Records the bootstrap height and writes all snapshot-seeded unspent
-    /// rows in a single batch. Called exactly once, at bootstrap time --
-    /// never touched by the normal per-block `write()` path below.
+    /// Records the bootstrap height and (re-)writes all snapshot-seeded
+    /// unspent rows in a single batch. Safe to call more than once: a
+    /// previous bootstrap's rows are cleared first. This matters when
+    /// `Index::ensure_no_prune_gap` re-runs the bootstrap after electrs fell
+    /// behind the daemon's prune floor -- the new `dumptxoutset` reflects
+    /// coins spent since the first bootstrap, and leaving the old rows in
+    /// place would keep reporting those as unspent forever.
     pub(crate) fn write_snapshot_bootstrap(
         &self,
         height: u32,
         rows: &[SerializedSnapshotUnspentRow],
     ) {
         let mut db_batch = rocksdb::WriteBatch::default();
+        let cf = self.snapshot_unspent_cf();
+        let existing: Vec<SerializedSnapshotUnspentRow> = self
+            .iter_cf(cf, rocksdb::ReadOptions::default(), None)
+            .collect();
+        for key in &existing {
+            db_batch.delete_cf(cf, key);
+        }
         for key in rows {
-            db_batch.put_cf(self.snapshot_unspent_cf(), key, b"");
+            db_batch.put_cf(cf, key, b"");
         }
         db_batch.put_cf(self.config_cf(), BOOTSTRAP_HEIGHT_KEY, height.to_le_bytes());
 

@@ -196,25 +196,46 @@ independent node operators.
       `SPENDING_CF` path.
 - [x] Sub-encoding unit tests written (VARINT, amount round-trip, P2PKH/P2SH
       reconstruction), hand-verified on paper; not yet run (see caveat below)
-- [ ] **Blocking:** compile and run `cargo check`/`cargo test` for the whole
-      crate (not just `src/snapshot.rs` in isolation -- the changes now
-      touch `chain.rs`, `config.rs`, `daemon.rs`, `db.rs`, `index.rs`,
-      `status.rs`, `tracker.rs`, and `internal/config_specification.toml`)
-      on a machine with real network access. The environment this was
-      written in cannot fetch crate contents from `static.crates.io` (only
-      the sparse index is reachable through its network policy), so
-      `cargo check`/`cargo test` could not be run here at all -- every one
-      of these changes has had a careful manual review but zero compiler or
-      test-runner feedback so far. In particular, double-check: `Magic::to_bytes()`
-      exists with that exact name in `bitcoin` 0.32.6; `Builder::push_slice()`
-      accepts `[u8; 33]`/`[u8; 65]` directly; the `configure_me` spec syntax
-      for the new `utxo_snapshot_dir` param matches `daemon_dir`'s pattern
-      closely enough to actually generate an `Option<PathBuf>` field. Do not
-      treat any of this as verified until it has actually built and the
-      tests above have actually run.
-- [ ] **Blocking:** validate parser against a real `dumptxoutset` fixture
-      from an actual node before this is trusted -- this is exactly what the
-      planned regtest test (small `MandatoryPruneDepth`/`nPruneAfterHeight`
-      of 100 on regtest, see `elektron-net`'s `CRegTestParams`) is for.
+- [x] **Blocking (resolved):** built and run on a real machine (Docker,
+      WSL2 Ubuntu regtest), not just this environment -- four real
+      compiler/runtime issues surfaced and got fixed one at a time:
+      `bitcoin::io::Read` vs `std::io::Read` for `consensus_decode()`;
+      `dumptxoutset` needing an explicit `"latest"` type argument; a P2P
+      network-magic mismatch (`signet_magic` unset, defaulted to stock
+      testnet magic); and a `/snapshot` bind-mount permission issue in the
+      daemon container's entrypoint. All fixed and pushed.
+- [x] **Blocking (resolved):** validated against a live `dumptxoutset`
+      fixture, not a synthetic one -- 800-block Elektron Net regtest,
+      `fastprune` forcing real file rollover/pruning (`pruneheight: 649`
+      confirmed), bootstrap wrote 800 coins at height 800. Cross-checked
+      `blockchain.scripthash.listunspent`/`get_balance` against the node
+      wallet's own `listunspent` for a real address: 500 UTXOs, summed sats
+      match `get_balance.confirmed` exactly (33484375000), 349 of those 500
+      entries sit at heights already pruned on the node. `get_history`
+      correctly returns `[]` for the bootstrap period (no crash, no bogus
+      entries).
+- [x] Prune-gap resilience: what happens if electrs is offline across one or
+      more *further* automatic-pruning checkpoints, so the daemon prunes
+      block bodies between electrs' last-known tip and its new prune floor
+      before electrs ever gets to index them? Found live (simulated: stopped
+      electrs at tip 800, generated 1250 more blocks on the node, restarted
+      electrs) that the old code would have tried `daemon.for_blocks()` for
+      already-pruned heights; the daemon replies `notfound`, which
+      `src/p2p.rs`'s message parser doesn't otherwise handle (`_ =>
+      bail!("unsupported message...")`), killing the P2P connection and
+      crashing electrs. Fixed: `Daemon::get_prune_height()` (new, reads
+      `getblockchaininfo`'s `pruneheight`) plus `Index::ensure_no_prune_gap()`
+      (new, called at the top of every `sync()` before indexing) detect a gap
+      between the daemon's current prune floor and our last-covered height
+      and re-run the §3.2 bootstrap to close it, capturing the UTXO set fresh
+      as of now rather than ever attempting a doomed body fetch.
+      `DBStore::write_snapshot_bootstrap()` now clears previously-written
+      `SNAPSHOT_UNSPENT_CF` rows before writing the new ones, since a second
+      bootstrap run must not leave stale entries for coins spent between the
+      two snapshots. Without `utxo_snapshot_dir` configured, the same gap now
+      fails with a clear, actionable error instead of the opaque P2P crash.
+      Implemented, live-reverification of the exact simulated scenario above
+      still pending (in progress).
 - [ ] Genesis-sync vs. bootstrap-sync equivalence integration test
-- [ ] Decide `dumptxoutset` vs. shared snapshot file (deployment question above)
+- [x] Decide `dumptxoutset` vs. shared snapshot file (deployment question
+      above): went with `dumptxoutset` for the first cut, as planned.

@@ -193,6 +193,39 @@ impl Index {
         Ok(())
     }
 
+    /// Guards against a gap opening up between what we've captured (via
+    /// bootstrap or ordinary indexing) and what the daemon still has block
+    /// bodies for. Left unindexed while electrs is offline (or otherwise
+    /// falls behind), heights above our bootstrap height but at or below the
+    /// daemon's *current* prune floor have neither a snapshot entry nor an
+    /// indexed body -- `index_blocks()` would ask the daemon for one of
+    /// these over P2P anyway, the daemon replies `notfound`, and `p2p.rs`
+    /// treats that as an unsupported message and kills the connection,
+    /// crashing electrs. Re-running the §3.2 bootstrap captures the UTXO set
+    /// fresh as of *now*, so it always covers the gap regardless of how far
+    /// behind we fell (not just the one-checkpoint case).
+    fn ensure_no_prune_gap(&self, daemon: &Daemon, next_height: u32) -> Result<()> {
+        let Some(prune_height) = daemon.get_prune_height().context("get_prune_height failed")?
+        else {
+            return Ok(()); // daemon reports itself as not pruned
+        };
+        let bootstrap_height = self.store.get_bootstrap_height().unwrap_or(0);
+        if prune_height <= bootstrap_height || next_height > prune_height {
+            return Ok(()); // still within what we've already captured or indexed
+        }
+        ensure!(
+            self.utxo_snapshot_dir.is_some(),
+            "daemon has pruned up to height {prune_height}, past our last covered height \
+             {bootstrap_height}, but no utxo_snapshot_dir is configured to re-bootstrap from -- \
+             configure it and wipe db_dir to recover"
+        );
+        warn!(
+            "daemon pruned past our last covered height ({bootstrap_height} -> {prune_height}), \
+             re-running the UTXO-snapshot bootstrap to close the gap"
+        );
+        self.bootstrap(daemon)
+    }
+
     pub(crate) fn chain(&self) -> &Chain {
         &self.chain
     }
@@ -264,6 +297,11 @@ impl Index {
         let new_headers = self
             .stats
             .observe_duration("headers", || daemon.get_new_headers(&self.chain))?;
+
+        if let Some(first) = new_headers.first() {
+            self.ensure_no_prune_gap(daemon, first.height() as u32)?;
+        }
+
         match (new_headers.first(), new_headers.last()) {
             (Some(first), Some(last)) => {
                 let count = new_headers.len();

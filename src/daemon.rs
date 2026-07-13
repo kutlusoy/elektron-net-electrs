@@ -41,6 +41,9 @@ struct BlockchainInfo {
     #[serde(rename = "initialblockdownload")]
     initial_block_download: bool,
     pruned: bool,
+    // Absent when `pruned` is false.
+    #[serde(default)]
+    pruneheight: Option<u32>,
 }
 
 fn get_blockchain_info(client: &Client) -> bitcoincore_rpc::Result<BlockchainInfo> {
@@ -315,6 +318,15 @@ impl Daemon {
 
     pub(crate) fn get_new_headers(&self, chain: &Chain) -> Result<Vec<NewHeader>> {
         self.p2p.lock().get_new_headers(chain)
+    }
+
+    /// The daemon's current prune floor (`getblockchaininfo`'s `pruneheight`):
+    /// block bodies at or below this height are gone, network-wide. `None`
+    /// when the daemon isn't pruned at all (never true on Elektron Net, but
+    /// checked rather than assumed).
+    pub(crate) fn get_prune_height(&self) -> Result<Option<u32>> {
+        let info = get_blockchain_info(&self.rpc).context("getblockchaininfo failed")?;
+        Ok(info.pruneheight)
     }
 
     /// Calls `dumptxoutset` on the daemon to produce a UTXO-snapshot file at
