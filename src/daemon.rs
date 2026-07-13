@@ -328,9 +328,13 @@ impl Daemon {
     /// metadata header.
     pub(crate) fn dump_txoutset(&self, path: &Path) -> Result<(u32, BlockHash)> {
         let path_str = path.to_str().context("non-UTF8 snapshot path")?;
+        // "latest": snapshot the UTXO set as of the current tip. The other
+        // accepted value, "rollback", would roll the node's state back to
+        // an older block first -- not what bootstrap needs, and considerably
+        // slower on a real chain.
         let response: Value = self
             .rpc
-            .call("dumptxoutset", &[json!(path_str)])
+            .call("dumptxoutset", &[json!(path_str), json!("latest")])
             .context("dumptxoutset RPC failed")?;
         let base_height = response
             .get("base_height")
