@@ -173,12 +173,22 @@ independent node operators.
 
 ## Status
 
-- [ ] Snapshot parser (`src/snapshot.rs`): VARINT, amount compression, script
-      compression
+- [x] Snapshot parser (`src/snapshot.rs`): VARINT, amount compression, script
+      compression, `SnapshotMetadata` and coin-entry reader. Written, not yet
+      compiled anywhere (see caveat below).
 - [ ] `SNAPSHOT_UNSPENT_CF` schema and write path
 - [ ] Bootstrap trigger in `Index::load()`
 - [ ] `Unspent::build()` integration
-- [ ] Sub-encoding unit tests (hand-verifiable, no live node needed)
+- [x] Sub-encoding unit tests written (VARINT, amount round-trip, P2PKH/P2SH
+      reconstruction), hand-verified on paper; not yet run (see caveat below)
+- [ ] **Blocking:** compile and run `cargo test` for `src/snapshot.rs` on a
+      machine with real network access. The environment this was written in
+      cannot fetch crate contents from `static.crates.io` (only the sparse
+      index is reachable through its network policy), so `cargo check`/`cargo
+      test` could not be run here at all -- this code has had a careful
+      manual review but zero compiler or test-runner feedback so far. Do not
+      treat it as verified until it has actually built and the tests above
+      have actually run.
 - [ ] **Blocking:** validate parser against a real `dumptxoutset` fixture
       from an actual node before this is trusted
 - [ ] Genesis-sync vs. bootstrap-sync equivalence integration test
