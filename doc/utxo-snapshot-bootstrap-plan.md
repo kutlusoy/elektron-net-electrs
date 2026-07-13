@@ -234,8 +234,15 @@ independent node operators.
       bootstrap run must not leave stale entries for coins spent between the
       two snapshots. Without `utxo_snapshot_dir` configured, the same gap now
       fails with a clear, actionable error instead of the opaque P2P crash.
-      Implemented, live-reverification of the exact simulated scenario above
-      still pending (in progress).
+      Live-verified: the gap detection fired exactly as designed on the
+      first real re-test (log: "daemon pruned past our last covered height
+      (800 -> 1945), re-running the UTXO-snapshot bootstrap to close the
+      gap"). That test then surfaced a second, smaller bug: `dumptxoutset`
+      refuses to overwrite an existing output file, and the first bootstrap's
+      leftover `electrs-bootstrap.dat` was still sitting on the shared mount,
+      failing the second run. Fixed: `Index::bootstrap()` now removes any
+      stale snapshot file at that path before calling `dumptxoutset` again.
+      Re-test pending.
 - [ ] Genesis-sync vs. bootstrap-sync equivalence integration test
 - [x] Decide `dumptxoutset` vs. shared snapshot file (deployment question
       above): went with `dumptxoutset` for the first cut, as planned.

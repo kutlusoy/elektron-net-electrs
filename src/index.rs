@@ -148,6 +148,21 @@ impl Index {
             .expect("bootstrap() only called when utxo_snapshot_dir is set");
         let path = dir.join("electrs-bootstrap.dat");
 
+        // dumptxoutset refuses to overwrite an existing file. Harmless to
+        // find one here: either this is a from-scratch bootstrap and a
+        // previous attempt left a stale file behind, or `ensure_no_prune_gap`
+        // is re-running the bootstrap and the first run's file is still
+        // sitting on the shared mount -- either way we're about to replace
+        // it with a fresh one and have no further use for the old contents.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to remove stale snapshot file {}", path.display()))
+            }
+        }
+
         info!("starting UTXO-snapshot bootstrap: {}", path.display());
         let (base_height, base_hash) = daemon
             .dump_txoutset(&path)
