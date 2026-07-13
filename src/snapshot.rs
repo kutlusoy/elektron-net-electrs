@@ -10,13 +10,12 @@
 //! fixture; that verification is a blocking step before this is trusted for
 //! anything beyond the hand-computed unit tests below.
 
-use std::io::Read;
-
 use anyhow::{bail, Context, Result};
 use bitcoin::blockdata::opcodes::all::OP_CHECKSIG;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
+use bitcoin::io::Read;
 use bitcoin::{Amount, BlockHash, OutPoint, PubkeyHash, ScriptBuf, ScriptHash, Txid};
 
 const SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
