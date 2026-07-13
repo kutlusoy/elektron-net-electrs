@@ -20,6 +20,7 @@ mod metrics;
 mod p2p;
 mod server;
 mod signals;
+mod snapshot;
 mod status;
 mod thread;
 mod tracker;
