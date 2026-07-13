@@ -174,22 +174,47 @@ independent node operators.
 ## Status
 
 - [x] Snapshot parser (`src/snapshot.rs`): VARINT, amount compression, script
-      compression, `SnapshotMetadata` and coin-entry reader. Written, not yet
-      compiled anywhere (see caveat below).
-- [ ] `SNAPSHOT_UNSPENT_CF` schema and write path
-- [ ] Bootstrap trigger in `Index::load()`
-- [ ] `Unspent::build()` integration
+      compression, `SnapshotMetadata` and coin-entry reader.
+- [x] `SNAPSHOT_UNSPENT_CF` schema (`SnapshotUnspentRow` in `src/types.rs`)
+      and write path (`DBStore::write_snapshot_bootstrap()`,
+      `get_bootstrap_height()` in `src/db.rs`).
+- [x] `Daemon::dump_txoutset()` (`src/daemon.rs`), new `utxo_snapshot_dir`
+      config option (`internal/config_specification.toml`, `src/config.rs`).
+- [x] Bootstrap trigger: `Index::bootstrap()`, called from the top of
+      `Index::sync()` on a fresh DB when `utxo_snapshot_dir` is set
+      (`src/index.rs`). `index_blocks()` now skips the P2P body fetch for
+      any height at or below the bootstrap height, recording only the
+      header (already available from the body-independent `getheaders`
+      walk, see `NewHeader::header()` in `src/chain.rs`) -- fixed a
+      self-found bug here where an all-header chunk left the batch's tip
+      marker at all-zeros instead of the chunk's actual last hash.
+- [x] `Unspent::build()` integration (`src/status.rs`): folds in
+      `Index::get_snapshot_unspent()` entries before the normal
+      confirmed/mempool folding; `ScriptHashStatus::sync()` now also seeds
+      these outpoints into its spending-detection set, so a later spend of
+      a bootstrap-seeded UTXO is still detected through the ordinary
+      `SPENDING_CF` path.
 - [x] Sub-encoding unit tests written (VARINT, amount round-trip, P2PKH/P2SH
       reconstruction), hand-verified on paper; not yet run (see caveat below)
-- [ ] **Blocking:** compile and run `cargo test` for `src/snapshot.rs` on a
-      machine with real network access. The environment this was written in
-      cannot fetch crate contents from `static.crates.io` (only the sparse
-      index is reachable through its network policy), so `cargo check`/`cargo
-      test` could not be run here at all -- this code has had a careful
-      manual review but zero compiler or test-runner feedback so far. Do not
-      treat it as verified until it has actually built and the tests above
-      have actually run.
+- [ ] **Blocking:** compile and run `cargo check`/`cargo test` for the whole
+      crate (not just `src/snapshot.rs` in isolation -- the changes now
+      touch `chain.rs`, `config.rs`, `daemon.rs`, `db.rs`, `index.rs`,
+      `status.rs`, `tracker.rs`, and `internal/config_specification.toml`)
+      on a machine with real network access. The environment this was
+      written in cannot fetch crate contents from `static.crates.io` (only
+      the sparse index is reachable through its network policy), so
+      `cargo check`/`cargo test` could not be run here at all -- every one
+      of these changes has had a careful manual review but zero compiler or
+      test-runner feedback so far. In particular, double-check: `Magic::to_bytes()`
+      exists with that exact name in `bitcoin` 0.32.6; `Builder::push_slice()`
+      accepts `[u8; 33]`/`[u8; 65]` directly; the `configure_me` spec syntax
+      for the new `utxo_snapshot_dir` param matches `daemon_dir`'s pattern
+      closely enough to actually generate an `Option<PathBuf>` field. Do not
+      treat any of this as verified until it has actually built and the
+      tests above have actually run.
 - [ ] **Blocking:** validate parser against a real `dumptxoutset` fixture
-      from an actual node before this is trusted
+      from an actual node before this is trusted -- this is exactly what the
+      planned regtest test (small `MandatoryPruneDepth`/`nPruneAfterHeight`
+      of 100 on regtest, see `elektron-net`'s `CRegTestParams`) is for.
 - [ ] Genesis-sync vs. bootstrap-sync equivalence integration test
 - [ ] Decide `dumptxoutset` vs. shared snapshot file (deployment question above)

@@ -132,6 +132,10 @@ pub struct Config {
     pub db_path: PathBuf,
     pub db_log_dir: Option<PathBuf>,
     pub db_parallelism: u8,
+    /// §3.2 UTXO-snapshot bootstrap directory, shared with the daemon. See
+    /// `doc/utxo-snapshot-bootstrap-plan.md`. `None` means "sync from
+    /// genesis as usual", the safe default.
+    pub utxo_snapshot_dir: Option<PathBuf>,
     pub daemon_auth: SensitiveAuth,
     pub daemon_rpc_addr: SocketAddr,
     pub daemon_p2p_addr: SocketAddr,
@@ -361,6 +365,7 @@ impl Config {
             db_path: config.db_dir,
             db_log_dir: config.db_log_dir,
             db_parallelism: config.db_parallelism,
+            utxo_snapshot_dir: config.utxo_snapshot_dir,
             daemon_auth,
             daemon_rpc_addr,
             daemon_p2p_addr,

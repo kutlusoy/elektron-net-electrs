@@ -47,6 +47,11 @@ doc = "Data directory of Bitcoind (default: ~/.bitcoin/)"
 default = "crate::config::default_daemon_dir()"
 
 [[param]]
+name = "utxo_snapshot_dir"
+type = "std::path::PathBuf"
+doc = "Directory shared with the daemon (read-write for it, read-only for electrs) used for the §3.2 UTXO-snapshot bootstrap on a pruned node with no existing index. Leave unset to skip the bootstrap and sync from genesis instead (only works while the daemon still retains genesis, i.e. before it first prunes)."
+
+[[param]]
 name = "auth"
 type = "String"
 doc = "JSONRPC authentication ('USER:PASSWORD', default: use cookie file)"

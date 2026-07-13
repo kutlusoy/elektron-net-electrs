@@ -26,6 +26,15 @@ impl NewHeader {
     pub(crate) fn hash(&self) -> BlockHash {
         self.hash
     }
+
+    /// The header itself, already available from the (P2P `getheaders`,
+    /// body-independent) header walk. Used by the §3.2 bootstrap path to
+    /// record a header row for a pruned height without needing the full
+    /// block body, which is unavailable for anything at or below the
+    /// bootstrap height.
+    pub(crate) fn header(&self) -> BlockHeader {
+        self.header
+    }
 }
 
 /// Current blockchain headers' list

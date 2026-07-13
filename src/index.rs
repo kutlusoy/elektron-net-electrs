@@ -3,7 +3,10 @@ use bitcoin::consensus::{deserialize, Decodable, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use bitcoin_slices::{bsl, Visit, Visitor};
+use std::fs::File;
+use std::io::BufReader;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::thread;
 
 use crate::{
@@ -12,9 +15,10 @@ use crate::{
     db::{DBStore, WriteBatch},
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
+    snapshot,
     types::{
-        bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow,
-        TxidRow,
+        bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock,
+        SnapshotUnspentRow, SpendingPrefixRow, TxidRow,
     },
 };
 
@@ -89,9 +93,14 @@ pub struct Index {
     stats: Stats,
     is_ready: bool,
     flush_needed: bool,
+    // §3.2 UTXO-snapshot bootstrap (see doc/utxo-snapshot-bootstrap-plan.md).
+    // `None` means "sync from genesis as usual", the safe default.
+    utxo_snapshot_dir: Option<PathBuf>,
+    network_magic: [u8; 4],
 }
 
 impl Index {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load(
         store: DBStore,
         mut chain: Chain,
@@ -99,6 +108,8 @@ impl Index {
         batch_size: usize,
         lookup_limit: Option<usize>,
         reindex_last_blocks: usize,
+        utxo_snapshot_dir: Option<PathBuf>,
+        network_magic: [u8; 4],
     ) -> Result<Self> {
         if let Some(row) = store.get_tip() {
             let tip = deserialize(&row).expect("invalid tip");
@@ -119,11 +130,87 @@ impl Index {
             stats,
             is_ready: false,
             flush_needed: false,
+            utxo_snapshot_dir,
+            network_magic,
         })
+    }
+
+    /// Runs the §3.2 UTXO-snapshot bootstrap exactly once, against a fresh
+    /// (never-synced) index: calls `dumptxoutset` on the daemon, parses the
+    /// resulting file (`crate::snapshot`), and seeds `SNAPSHOT_UNSPENT_CF`
+    /// with every entry. Block bodies at or below the returned height are
+    /// never fetched afterwards (see `index_blocks()`) -- only their
+    /// headers are, which stay available on a pruned daemon.
+    fn bootstrap(&self, daemon: &Daemon) -> Result<()> {
+        let dir = self
+            .utxo_snapshot_dir
+            .as_ref()
+            .expect("bootstrap() only called when utxo_snapshot_dir is set");
+        let path = dir.join("electrs-bootstrap.dat");
+
+        info!("starting UTXO-snapshot bootstrap: {}", path.display());
+        let (base_height, base_hash) = daemon
+            .dump_txoutset(&path)
+            .context("dumptxoutset failed")?;
+
+        let file = File::open(&path)
+            .with_context(|| format!("failed to open snapshot file {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let metadata = snapshot::SnapshotMetadata::read(&mut reader, self.network_magic)
+            .context("failed to read snapshot metadata")?;
+        if metadata.base_blockhash != base_hash {
+            bail!(
+                "snapshot file base blockhash {} does not match dumptxoutset response {}",
+                metadata.base_blockhash,
+                base_hash
+            );
+        }
+
+        let coins = snapshot::read_coins(&mut reader, metadata.coins_count)
+            .context("failed to read snapshot coins")?;
+        let rows: Vec<_> = coins
+            .iter()
+            .map(|coin| {
+                let scripthash = ScriptHash::new(&coin.script_pubkey);
+                SnapshotUnspentRow::new(
+                    scripthash,
+                    coin.outpoint.txid,
+                    coin.outpoint.vout,
+                    coin.amount.to_sat(),
+                    coin.height as usize,
+                )
+                .to_db_row()
+            })
+            .collect();
+
+        self.store.write_snapshot_bootstrap(base_height, &rows);
+        info!(
+            "UTXO-snapshot bootstrap complete: {} coins at height {} ({})",
+            rows.len(),
+            base_height,
+            base_hash
+        );
+        Ok(())
     }
 
     pub(crate) fn chain(&self) -> &Chain {
         &self.chain
+    }
+
+    /// §3.2 bootstrap-seeded unspent outputs for `scripthash` (empty if no
+    /// bootstrap ever ran, or none of its outputs belong to this
+    /// scripthash). Each entry is `(outpoint, value in sats, height)`,
+    /// self-contained: unlike `filter_by_funding`, resolving these needs no
+    /// re-fetch of a historical block, since that data is gone by design
+    /// for anything at or below the bootstrap height.
+    pub(crate) fn get_snapshot_unspent(&self, scripthash: ScriptHash) -> Vec<(OutPoint, u64, usize)> {
+        self.store
+            .iter_snapshot_unspent(SnapshotUnspentRow::scan_prefix(scripthash))
+            .map(|row| {
+                let row = SnapshotUnspentRow::from_db_row(row);
+                (row.outpoint(), row.value, row.height())
+            })
+            .collect()
     }
 
     pub(crate) fn limit_result<T>(&self, entries: impl Iterator<Item = T>) -> Result<Vec<T>> {
@@ -167,6 +254,13 @@ impl Index {
 
     // Return `Ok(true)` when the chain is fully synced and the index is compacted.
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
+        if self.store.get_tip().is_none()
+            && self.store.get_bootstrap_height().is_none()
+            && self.utxo_snapshot_dir.is_some()
+        {
+            self.bootstrap(daemon)?;
+        }
+
         let new_headers = self
             .stats
             .observe_duration("headers", || daemon.get_new_headers(&self.chain))?;
@@ -237,10 +331,48 @@ impl Index {
     }
 
     fn index_blocks(&self, daemon: &Daemon, chunk: &[NewHeader]) -> Result<WriteBatch> {
-        let blockhashes: Vec<BlockHash> = chunk.iter().map(|h| h.hash()).collect();
-        let mut heights = chunk.iter().map(|h| h.height());
-
         let mut batch = WriteBatch::default();
+
+        // Always set the batch's tip marker from the chunk itself, up
+        // front. `index_single_block()` below re-derives (and overwrites)
+        // this from each fetched block body as well, which is redundant
+        // but harmless when bodies ARE fetched -- what matters is that it's
+        // set correctly even when they're not: a chunk entirely at or below
+        // the bootstrap height fetches no bodies at all, and would
+        // otherwise leave this all-zeros, corrupting HEADERS_CF's TIP_KEY
+        // if such a chunk happens to be the last one written.
+        let chunk_tip_hash = chunk.last().expect("chunk is never empty").hash();
+        let len = chunk_tip_hash
+            .consensus_encode(&mut (&mut batch.tip_row as &mut [u8]))
+            .expect("in-memory writers don't error");
+        debug_assert_eq!(len, BlockHash::LEN);
+
+        // Heights at or below the §3.2 bootstrap height have no block body
+        // available anywhere on the network (that's exactly why bootstrap
+        // exists) -- record only the header, straight from the
+        // already-fetched `NewHeader` (P2P `getheaders`, body-independent),
+        // and skip the P2P body fetch entirely for them.
+        let bootstrap_height = self.store.get_bootstrap_height();
+        let mut to_fetch: Vec<&NewHeader> = Vec::with_capacity(chunk.len());
+        for new_header in chunk {
+            let below_bootstrap = bootstrap_height
+                .map(|h| new_header.height() as u32 <= h)
+                .unwrap_or(false);
+            if below_bootstrap {
+                batch
+                    .header_rows
+                    .push(HeaderRow::new(new_header.header()).to_db_row());
+            } else {
+                to_fetch.push(new_header);
+            }
+        }
+
+        if to_fetch.is_empty() {
+            return Ok(batch);
+        }
+
+        let blockhashes: Vec<BlockHash> = to_fetch.iter().map(|h| h.hash()).collect();
+        let mut heights = to_fetch.iter().map(|h| h.height());
 
         daemon.for_blocks(blockhashes, |blockhash, block| {
             let height = heights.next().expect("unexpected block");

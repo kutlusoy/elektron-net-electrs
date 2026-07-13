@@ -4,7 +4,9 @@ use electrs_rocksdb as rocksdb;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::types::{HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow};
+use crate::types::{
+    HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow, SerializedSnapshotUnspentRow,
+};
 
 #[derive(Default)]
 pub(crate) struct WriteBatch {
@@ -35,11 +37,25 @@ const HEADERS_CF: &str = "headers";
 const TXID_CF: &str = "txid";
 const FUNDING_CF: &str = "funding";
 const SPENDING_CF: &str = "spending";
+// §3.2 UTXO-snapshot bootstrap (see doc/utxo-snapshot-bootstrap-plan.md):
+// entries seeded once from a `dumptxoutset` snapshot, carrying the amount
+// directly since the originating block is gone by the time bootstrap runs.
+const SNAPSHOT_UNSPENT_CF: &str = "snapshot_unspent";
 
-const COLUMN_FAMILIES: &[&str] = &[CONFIG_CF, HEADERS_CF, TXID_CF, FUNDING_CF, SPENDING_CF];
+const COLUMN_FAMILIES: &[&str] = &[
+    CONFIG_CF,
+    HEADERS_CF,
+    TXID_CF,
+    FUNDING_CF,
+    SPENDING_CF,
+    SNAPSHOT_UNSPENT_CF,
+];
 
 const CONFIG_KEY: &str = "C";
 const TIP_KEY: &[u8] = b"T";
+// Height of the block the index was bootstrapped from (§3.2), if any.
+// Absent for an index that was (or is being) synced from genesis normally.
+const BOOTSTRAP_HEIGHT_KEY: &[u8] = b"B";
 
 // Taken from https://github.com/facebook/rocksdb/blob/master/include/rocksdb/db.h#L654-L689
 const DB_PROPERTIES: &[&str] = &[
@@ -230,6 +246,12 @@ impl DBStore {
         self.db.cf_handle(HEADERS_CF).expect("missing HEADERS_CF")
     }
 
+    fn snapshot_unspent_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(SNAPSHOT_UNSPENT_CF)
+            .expect("missing SNAPSHOT_UNSPENT_CF")
+    }
+
     pub(crate) fn iter_funding(
         &self,
         prefix: HashPrefix,
@@ -249,6 +271,15 @@ impl DBStore {
         prefix: HashPrefix,
     ) -> impl Iterator<Item = SerializedHashPrefixRow> + '_ {
         self.iter_prefix_cf(self.txid_cf(), prefix)
+    }
+
+    pub(crate) fn iter_snapshot_unspent(
+        &self,
+        prefix: HashPrefix,
+    ) -> impl Iterator<Item = SerializedSnapshotUnspentRow> + '_ {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_prefix_same_as_start(true); // requires .set_prefix_extractor() above.
+        self.iter_cf(self.snapshot_unspent_cf(), opts, Some(prefix))
     }
 
     fn iter_cf<const N: usize>(
@@ -280,6 +311,37 @@ impl DBStore {
         self.db
             .get_cf(self.headers_cf(), TIP_KEY)
             .expect("get_tip failed")
+    }
+
+    /// Height the index was bootstrapped from (§3.2), if a UTXO-snapshot
+    /// bootstrap has run against this DB. `None` for an index synced from
+    /// genesis normally.
+    pub(crate) fn get_bootstrap_height(&self) -> Option<u32> {
+        let raw = self
+            .db
+            .get_cf(self.config_cf(), BOOTSTRAP_HEIGHT_KEY)
+            .expect("get_bootstrap_height failed")?;
+        let bytes: [u8; 4] = raw.try_into().expect("bad bootstrap height");
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    /// Records the bootstrap height and writes all snapshot-seeded unspent
+    /// rows in a single batch. Called exactly once, at bootstrap time --
+    /// never touched by the normal per-block `write()` path below.
+    pub(crate) fn write_snapshot_bootstrap(
+        &self,
+        height: u32,
+        rows: &[SerializedSnapshotUnspentRow],
+    ) {
+        let mut db_batch = rocksdb::WriteBatch::default();
+        for key in rows {
+            db_batch.put_cf(self.snapshot_unspent_cf(), key, b"");
+        }
+        db_batch.put_cf(self.config_cf(), BOOTSTRAP_HEIGHT_KEY, height.to_le_bytes());
+
+        let mut opts = rocksdb::WriteOptions::new();
+        opts.set_sync(true); // one-time write, correctness matters more than speed here
+        self.db.write_opt(db_batch, &opts).unwrap();
     }
 
     pub(crate) fn write(&self, batch: &WriteBatch) {

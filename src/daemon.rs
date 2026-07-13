@@ -317,6 +317,35 @@ impl Daemon {
         self.p2p.lock().get_new_headers(chain)
     }
 
+    /// Calls `dumptxoutset` on the daemon to produce a UTXO-snapshot file at
+    /// `path` (§3.2 bootstrap, see `doc/utxo-snapshot-bootstrap-plan.md`).
+    /// `path` is resolved from the *daemon's* filesystem -- it must be
+    /// reachable there for the RPC to succeed, and the same path (or an
+    /// equivalent one through a shared mount) must be readable from here
+    /// afterwards for `crate::snapshot` to parse the result. Returns the
+    /// snapshot's base block height and hash, straight from the RPC
+    /// response, for the caller to cross-check against the file's own
+    /// metadata header.
+    pub(crate) fn dump_txoutset(&self, path: &Path) -> Result<(u32, BlockHash)> {
+        let path_str = path.to_str().context("non-UTF8 snapshot path")?;
+        let response: Value = self
+            .rpc
+            .call("dumptxoutset", &[json!(path_str)])
+            .context("dumptxoutset RPC failed")?;
+        let base_height = response
+            .get("base_height")
+            .and_then(Value::as_u64)
+            .context("dumptxoutset response missing base_height")?;
+        let base_height = u32::try_from(base_height).context("base_height out of range")?;
+        let base_hash: BlockHash = response
+            .get("base_hash")
+            .and_then(Value::as_str)
+            .context("dumptxoutset response missing base_hash")?
+            .parse()
+            .context("dumptxoutset response has invalid base_hash")?;
+        Ok((base_height, base_hash))
+    }
+
     pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,

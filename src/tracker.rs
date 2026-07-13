@@ -47,6 +47,8 @@ impl Tracker {
                 config.index_batch_size,
                 config.index_lookup_limit,
                 config.reindex_last_blocks,
+                config.utxo_snapshot_dir.clone(),
+                config.signet_magic.to_bytes(),
             )
             .context("failed to open index")?,
             mempool: Mempool::new(&metrics),
@@ -68,7 +70,7 @@ impl Tracker {
     }
 
     pub(crate) fn get_unspent(&self, status: &ScriptHashStatus) -> Vec<UnspentEntry> {
-        status.get_unspent(self.index.chain())
+        status.get_unspent(&self.index)
     }
 
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
@@ -99,7 +101,7 @@ impl Tracker {
     }
 
     pub(crate) fn get_balance(&self, status: &ScriptHashStatus) -> Balance {
-        status.get_balance(self.chain())
+        status.get_balance(&self.index)
     }
 
     pub(crate) fn lookup_transaction(
