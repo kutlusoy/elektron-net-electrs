@@ -136,8 +136,8 @@ impl RpcError {
 /// expected, permanent condition - not a transient failure. Mapped to a typed
 /// Electrum error (`RpcError::BlockPruned`) in `Call::response()`.
 #[derive(Debug)]
-struct BlockPrunedError {
-    height: usize,
+pub(crate) struct BlockPrunedError {
+    pub(crate) height: usize,
 }
 
 impl fmt::Display for BlockPrunedError {
