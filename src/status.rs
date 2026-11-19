@@ -18,10 +18,25 @@ use crate::{
     cache::Cache,
     chain::Chain,
     daemon::Daemon,
+    electrum::BlockPrunedError,
     index::Index,
     mempool::Mempool,
     types::{bsl_txid, ScriptHash, SerBlock, StatusHash},
 };
+
+/// Elektron Net's mandatory prune depth. The daemon disconnects any p2p peer
+/// that asks for a block deeper than this below its tip, which kills the
+/// shared p2p connection and with it the whole process.
+const MANDATORY_PRUNE_DEPTH: usize = 197_280;
+
+/// Lowest height among `heights` that the daemon will no longer serve.
+fn oldest_unservable_height(
+    tip_height: usize,
+    heights: impl Iterator<Item = usize>,
+) -> Option<usize> {
+    let min_servable = tip_height.saturating_sub(MANDATORY_PRUNE_DEPTH);
+    heights.filter(|height| *height < min_servable).min()
+}
 
 /// Given a scripthash, store relevant inputs and outputs of a specific transaction
 struct TxEntry {
@@ -328,17 +343,30 @@ impl ScriptHashStatus {
     }
 
     /// Apply `func` only on the new blocks (to be fetched via p2p interface).
-    fn for_new_blocks<B, F>(&self, blockhashes: B, daemon: &Daemon, func: F) -> Result<()>
+    /// Fails with `BlockPrunedError` before touching the p2p connection if a
+    /// block lies below the daemon's serving window.
+    fn for_new_blocks<B, F>(
+        &self,
+        blockhashes: B,
+        chain: &Chain,
+        daemon: &Daemon,
+        func: F,
+    ) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock),
     {
-        daemon.for_blocks(
-            blockhashes
-                .into_iter()
-                .filter(|blockhash| !self.confirmed.contains_key(blockhash)),
-            func,
-        )
+        let blockhashes: Vec<BlockHash> = blockhashes
+            .into_iter()
+            .filter(|blockhash| !self.confirmed.contains_key(blockhash))
+            .collect();
+        let heights = blockhashes
+            .iter()
+            .filter_map(|blockhash| chain.get_block_height(blockhash));
+        if let Some(height) = oldest_unservable_height(chain.height(), heights) {
+            return Err(anyhow::Error::new(BlockPrunedError { height }));
+        }
+        daemon.for_blocks(blockhashes, func)
     }
 
     /// Get funding and spending entries from new blocks.
@@ -353,8 +381,9 @@ impl ScriptHashStatus {
         // Will be updated during the following block scans
         let mut result = HashMap::<BlockHash, HashMap<usize, TxEntry>>::new();
 
+        let chain = index.chain();
         let funding_blockhashes = index.limit_result(index.filter_by_funding(self.scripthash))?;
-        self.for_new_blocks(funding_blockhashes, daemon, |blockhash, block| {
+        self.for_new_blocks(funding_blockhashes, chain, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
             // extract relevant funding transactions
@@ -375,7 +404,7 @@ impl ScriptHashStatus {
             .par_iter() // use rayon for concurrent index lookups
             .flat_map_iter(|outpoint| index.filter_by_spending(*outpoint))
             .collect();
-        self.for_new_blocks(spending_blockhashes, daemon, |blockhash, block| {
+        self.for_new_blocks(spending_blockhashes, chain, daemon, |blockhash, block| {
             let block_entries = result.entry(blockhash).or_default(); // the block may already exist
 
             // extract relevant spending transactions
@@ -644,10 +673,23 @@ mod tests {
 
     use crate::types::ScriptHash;
 
-    use super::HistoryEntry;
+    use super::{oldest_unservable_height, HistoryEntry, MANDATORY_PRUNE_DEPTH};
     use bitcoin::{Address, Amount};
     use bitcoin_test_data::blocks::mainnet_702861;
     use serde_json::json;
+
+    #[test]
+    fn test_oldest_unservable_height() {
+        let tip = 317_856;
+        let edge = tip - MANDATORY_PRUNE_DEPTH;
+        assert_eq!(oldest_unservable_height(tip, [tip, edge].into_iter()), None);
+        assert_eq!(
+            oldest_unservable_height(tip, [tip, edge - 1, 65_536].into_iter()),
+            Some(65_536)
+        );
+        assert_eq!(oldest_unservable_height(tip, std::iter::empty()), None);
+        assert_eq!(oldest_unservable_height(1000, [0, 500].into_iter()), None);
+    }
 
     #[test]
     fn test_txinfo_json() {
