@@ -3,6 +3,8 @@ use bitcoin::Network;
 use bitcoincore_rpc::Auth;
 use dirs_next::home_dir;
 
+use crate::fx::SensitiveUserPass;
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::SocketAddr;
@@ -152,9 +154,27 @@ pub struct Config {
     pub skip_block_download_wait: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
+    /// Elektron Net FX: conversion rates without an exchange (see src/fx.rs).
+    pub fx_rate_url: String,
+    pub fx_refresh: Duration,
+    pub fx_snapshot_path: Option<PathBuf>,
+    /// Rich-shape rates file (source/market metadata) for the elek-web /fx route.
+    pub fx_rates_path: Option<PathBuf>,
+    /// Live P2P market source: the kdf daemon whose order book defines the
+    /// market rate whenever one exists (empty url disables, see src/fx.rs).
+    pub fx_orderbook_rpc_url: String,
+    /// Never logged — redacted `Debug` (`<sensitive>`), like `daemon_auth`.
+    pub fx_orderbook_userpass: SensitiveUserPass,
+    pub fx_orderbook_base: String,
+    pub fx_orderbook_rel: String,
+    pub fx_btc_prices_url: String,
+    /// Optional HTTP endpoint serving the FX rate files to non-Electrum
+    /// consumers (unset = disabled, see src/fx.rs FxHttp).
+    pub fx_http_addr: Option<SocketAddr>,
     pub signet_magic: Magic,
 }
 
+#[derive(Clone)]
 pub struct SensitiveAuth(pub Auth);
 
 impl SensitiveAuth {
@@ -382,6 +402,16 @@ impl Config {
             skip_block_download_wait: config.skip_block_download_wait,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
+            fx_rate_url: config.fx_rate_url,
+            fx_refresh: Duration::from_secs(config.fx_refresh_secs),
+            fx_snapshot_path: config.fx_snapshot_path,
+            fx_rates_path: config.fx_rates_path,
+            fx_orderbook_rpc_url: config.fx_orderbook_rpc_url,
+            fx_orderbook_userpass: SensitiveUserPass(config.fx_orderbook_userpass),
+            fx_orderbook_base: config.fx_orderbook_base,
+            fx_orderbook_rel: config.fx_orderbook_rel,
+            fx_btc_prices_url: config.fx_btc_prices_url,
+            fx_http_addr: config.fx_http_addr.map(|addr| addr.resolve_or_exit()),
             signet_magic: magic,
         };
         eprintln!(

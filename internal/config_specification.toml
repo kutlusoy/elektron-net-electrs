@@ -156,3 +156,61 @@ doc = "Logging filters, overriding `RUST_LOG` environment variable (see https://
 name = "signet_magic"
 type = "String"
 doc = "network magic in hex format, overriding the network default (Elektron Net mainnet: e1ec7a6e), as found in the daemon's logs"
+
+# ---- Elektron Net FX: conversion rates without an exchange (see src/fx.rs) ----
+[[param]]
+name = "fx_rate_url"
+type = "String"
+doc = "URL of the project's conversion-rate file (registry rate.json, fetched periodically). Set to an empty string to disable the registry source. When the fetch fails, the mining cost-floor model is used as fallback."
+default = "\"https://raw.githubusercontent.com/kutlusoy/elektron-net-registry/main/rate.json\".to_owned()"
+
+[[param]]
+name = "fx_refresh_secs"
+type = "u64"
+doc = "How often conversion rates are refreshed, in seconds"
+default = "300"
+
+[[param]]
+name = "fx_snapshot_path"
+type = "std::path::PathBuf"
+doc = "Write conversion rates as a JSON file in mempool /api/v1/prices shape (for the elektron-net mempool fork) to this path. Leave unset to disable."
+
+[[param]]
+name = "fx_rates_path"
+type = "std::path::PathBuf"
+doc = "Write conversion rates as a JSON file with full source/market metadata (consumed by the elek-web /fx route) to this path. Leave unset to disable."
+
+[[param]]
+name = "fx_orderbook_rpc_url"
+type = "String"
+doc = "HTTP JSON-RPC root URL of the market daemon (kdf) whose P2P order book defines the live market rate, e.g. http://127.0.0.1:7796. Set to an empty string (the default) to disable this source; the rate then falls back to the registry file and the mining cost floor."
+default = "\"\".to_owned()"
+
+[[param]]
+name = "fx_orderbook_userpass"
+type = "String"
+doc = "userpass of the market daemon's RPC, passed as the JSON body's userpass field. Never logged."
+default = "\"\".to_owned()"
+
+[[param]]
+name = "fx_orderbook_base"
+type = "String"
+doc = "Base ticker of the order book pair the market rate is read from"
+default = "\"ELEK\".to_owned()"
+
+[[param]]
+name = "fx_orderbook_rel"
+type = "String"
+doc = "Quote ticker of the order book pair. USD/USDT books are used as USD rates directly; BTC books are converted with the reference prices from fx_btc_prices_url"
+default = "\"BTC\".to_owned()"
+
+[[param]]
+name = "fx_btc_prices_url"
+type = "String"
+doc = "URL of a mempool /api/v1/prices-shaped file used to convert a BTC-denominated order book price (BTC/rBTC/tBTC) into fiat. Set to an empty string to disable (a BTC book then cannot produce a rate)"
+default = "\"https://mempool.space/api/v1/prices\".to_owned()"
+
+[[param]]
+name = "fx_http_addr"
+type = "crate::config::ResolvAddr"
+doc = "Optional HTTP endpoint serving this node's FX rates to consumers without Electrum access (wallets, stats pages): GET /fx/rates.json (same rich shape as fx_rates_path) and GET /fx/prices.json (same mempool shape as fx_snapshot_path). Unset = disabled; keep it loopback-bound unless LAN reach is intended"
